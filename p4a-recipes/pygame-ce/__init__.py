@@ -16,24 +16,36 @@ p4a 配方：pygame-ce（社区维护版 pygame）
 
 2) p4a 官方配方库里 **没有** pygame-ce，所以自带一份（local_recipes 优先级更高）。
 
-为什么还要动 pyproject.toml？
+为什么还要改 pyproject.toml？
 -----------------------------
-pygame-ce 从 2.5.0 起把 **meson** 设为默认构建后端，但它的 `meson.build` 里
-对 Android 是直接报错退出的：
+pygame-ce 从 2.5.0 起把 **meson** 设为默认构建后端（`build-backend = 'mesonpy'`），
+但它的 `meson.build` 里对 Android 是直接报错退出的：
 
     elif host_machine.system() == 'android'
         error('The meson buildconfig of pygame-ce does not support android for now.',
               'However it may be added in the future')
 
-而 pip 只要在源码根目录看到 `pyproject.toml` 的 `[build-system]`，就**一定**会走
-meson（表现为在 x86 runner 上试图运行交叉编译出的 ARM 程序）：
+而 pip 只认 `pyproject.toml` 的 `[build-system]`：看到 meson 就一定走 meson，
+表现为在 x86 runner 上试图**运行**交叉编译出来的 ARM 程序：
 
     meson.build:1:0: ERROR: Could not invoke sanity check executable ...
-    sanity_check_for_c.exe', binary or interpreter not executable
+    sanity_check_for_c.py-.../sanity_check_for_c.exe', binary or interpreter not executable
 
-于是唯一支持 Android 的 `setup.py` 路径被完全跳过。这里把构建后端换回
-setuptools，强制走 `setup.py` + 下面写好的 `Setup` 文件（与 p4a 官方 pygame
-配方的流程一致）。
+于是唯一支持 Android 的 `setup.py`（2.5.8 里仍是完整的老式 setuptools 脚本，
+会读根目录的 `Setup` 文件、认 `PYGAME_ANDROID` 环境变量，且**不含
+longintrepr.h**）被完全跳过。所以这里只把 `[build-system]` 换成 setuptools，
+让 p4a 那条 `pip install .` 走 `setup.py`。
+
+⚠️ `[project]` 表**必须原样保留，绝对不能改**（踩过两次坑）：
+   - 删掉整个 `[project]` → `buildconfig/get_version.py` 取不到
+     `conf["project"]["version"]` → `KeyError: 'project'`；
+   - 只留一个 `[project] name/version` 最小集 → setuptools 认为其余字段
+     "在 pyproject 外定义、被忽略"，随后在 `_long_description` 里
+     `AttributeError: 'NoneType' object has no attribute 'get'`。
+   p4a 跑的是 `python setup.py build_ext`，而 setuptools 只要看到 `[project]`
+   就会拿它当权威元数据源，两边必须一致。
+   （已用真实 sdist 做过对照实验：保留原 `[project]` + 只换 `[build-system]`
+   → 通过；最小化 `[project]` → 复现上述两个错误。）
 
 用法：
     1. buildozer.spec 里
@@ -42,46 +54,50 @@ setuptools，强制走 `setup.py` + 下面写好的 `Setup` 文件（与 p4a 官
     2. 游戏代码里照旧 `import pygame`，不用改任何一行。
 """
 import os
+import re
 from os.path import join
 
 from pythonforandroid.recipe import CompiledComponentsPythonRecipe
 from pythonforandroid.toolchain import current_directory
 
-# 强制走 setup.py（Android 唯一可用的构建路径）。
-#
-# 注意：[project] 段**不能删**。setup.py 第 12 行就 `import buildconfig.get_version`，
-# 而 get_version.py 在 Python>=3.11 下会 tomllib 读 pyproject.toml 的
-# `conf["project"]["version"]`。上一版把整个文件覆盖掉，直接
-# `KeyError: 'project'` 挂在 setup.py 第 12 行。
-# 这里只保留 name/version 最小集，避免 setuptools 对 readme/license 等
-# 与 setup.py 重复定义的字段抛 InvalidConfigError（已本地实测：name/version
-# 两处同时定义不会报错，[project] 的值会胜出）。
-_SETUPTOOLS_PYPROJECT = """\
-# 由 p4a-recipes/pygame-ce 覆写：pygame-ce 默认的 meson 后端不支持 Android，
-# 必须退回 setuptools + setup.py（原因见该配方文件头部）。
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+# 用来顶掉 meson 后端。只替换 [build-system] 段，[project] 保持上游原样。
+_SETUPTOOLS_BUILD_SYSTEM = (
+    "[build-system]\n"
+    'requires = ["setuptools>=61.0", "wheel"]\n'
+    'build-backend = "setuptools.build_meta"\n'
+)
 
-[project]
-name = "pygame-ce"
-version = "{version}"
-"""
+# 从 "[build-system]" 一直匹配到下一个行首的 "[" 之前（即整个段）。
+_BUILD_SYSTEM_RE = re.compile(r"\[build-system\][\s\S]*?(?=\n\[|\Z)")
 
 
-def _inc_flags(dirs) -> str:
-    """把目录列表拼成 -I 参数，顺便去重。
+def _force_setuptools_backend(build_dir: str) -> None:
+    """把源码树里的 [build-system] 从 meson 换成 setuptools。
 
-    多传几个不存在的 -I 目录对 clang 是无害的，所以这里按
-    "配方提供的目录 + 硬编码回退路径" 两种来源合起来收集，
-    避免某一种在特定 p4a 版本上取不到头文件目录。
+    只动这一段：`[project]` 是 setup.py / buildconfig.get_version 的元数据来源，
+    改坏它会让构建在元数据解析阶段就崩（见文件头部说明）。
+
+    余下的 `[tool.meson-python.args]` / `[tool.cibuildwheel.*]` 段会被保留，
+    它们对 setuptools 是无关的第三方工具表，不会生效也不会报错。
     """
-    seen, out = set(), []
-    for d in dirs:
-        if d and d not in seen:
-            seen.add(d)
-            out.append("-I" + d)
-    return " ".join(out)
+    path = join(build_dir, "pyproject.toml")
+    if not os.path.exists(path):
+        raise RuntimeError(
+            "pyproject.toml 不见了：本配方依赖它来关掉 meson 后端，"
+            "请检查上游包结构是否变化")
+
+    with open(path, encoding="utf-8") as fp:
+        text = fp.read()
+
+    new_text, count = _BUILD_SYSTEM_RE.subn(
+        _SETUPTOOLS_BUILD_SYSTEM, text, count=1)
+    if count != 1:
+        raise RuntimeError(
+            "pyproject.toml 里没找到 [build-system] 段，"
+            "无法切换到 setuptools 后端；上游结构可能已变化")
+
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(new_text)
 
 
 class Pygame2Recipe(CompiledComponentsPythonRecipe):
@@ -124,20 +140,23 @@ class Pygame2Recipe(CompiledComponentsPythonRecipe):
             boot = self.ctx.bootstrap.build_dir
 
             sdl2_mixer_recipe = self.get_recipe("sdl2_mixer", self.ctx)
-            sdl_mixer_includes = _inc_flags(
-                list(sdl2_mixer_recipe.get_include_dirs(arch))
-                + [join(boot, "jni", "SDL2_mixer", "include"),
-                   join(boot, "jni", "SDL2_mixer")])
+            sdl_mixer_includes = " ".join(
+                "-I" + d for d in dict.fromkeys(
+                    list(sdl2_mixer_recipe.get_include_dirs(arch))
+                    + [join(boot, "jni", "SDL2_mixer", "include"),
+                       join(boot, "jni", "SDL2_mixer")]))
 
             sdl2_image_recipe = self.get_recipe("sdl2_image", self.ctx)
-            sdl_image_includes = _inc_flags(
-                list(sdl2_image_recipe.get_include_dirs(arch))
-                + [join(boot, "jni", "SDL2_image", "include"),
-                   join(boot, "jni", "SDL2_image")])
+            sdl_image_includes = " ".join(
+                "-I" + d for d in dict.fromkeys(
+                    list(sdl2_image_recipe.get_include_dirs(arch))
+                    + [join(boot, "jni", "SDL2_image", "include"),
+                       join(boot, "jni", "SDL2_image")]))
 
-            sdl_ttf_includes = _inc_flags(
-                [join(boot, "jni", "SDL2_ttf", "include"),
-                 join(boot, "jni", "SDL2_ttf")])
+            sdl_ttf_includes = " ".join(
+                "-I" + d for d in dict.fromkeys(
+                    [join(boot, "jni", "SDL2_ttf", "include"),
+                     join(boot, "jni", "SDL2_ttf")]))
 
             setup_file = setup_template.format(
                 sdl_includes=(
@@ -163,9 +182,8 @@ class Pygame2Recipe(CompiledComponentsPythonRecipe):
             # 所以这里显式把 Setup 的时间戳推到最新，彻底消除这个隐患。
             os.utime("Setup", None)
 
-            # 关掉 meson 后端（详见文件头部说明），逼 pip 走 setup.py。
-            with open("pyproject.toml", "w") as fp:
-                fp.write(_SETUPTOOLS_PYPROJECT.format(version=self.version))
+            # 关掉 meson 后端，逼 pip 走 setup.py（详见文件头部说明）。
+            _force_setuptools_backend(".")
 
     def get_recipe_env(self, arch):
         env = super().get_recipe_env(arch)
