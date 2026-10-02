@@ -13,7 +13,7 @@ jobs:
   apk:
     name: 构建 debug APK（buildozer-action）
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: 拉取代码

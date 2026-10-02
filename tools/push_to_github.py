@@ -152,7 +152,7 @@ class GitHub:
 SKIP_DIRS = {".git", ".workbuddy", "__pycache__", "preview", ".buildozer",
              "bin", "out", "dist", ".pytest_cache", ".venv", "venv",
              ".vscode", ".idea"}
-SKIP_FILES = {"debug.log", ".DS_Store", "Thumbs.db"}
+SKIP_FILES = {"debug.log", ".DS_Store", "Thumbs.db", ".build_log.txt"}
 SKIP_EXT = {".pyc", ".pyo", ".apk", ".aab"}
 
 # 凭据类文件：名字里出现这些关键词就一律不上传。

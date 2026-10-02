@@ -16,7 +16,7 @@ jobs:
     # 官方镜像里已经装好 buildozer / Android SDK / NDK / JDK，省去半小时的环境搭建
     container:
       image: kivy/buildozer:latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: 拉取代码
@@ -30,12 +30,17 @@ jobs:
           path: |
             /root/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-v1-${{ github.run_id }}
+          key: buildozer-${{ runner.os }}-v2-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-v1-
+            buildozer-${{ runner.os }}-v2-
             buildozer-${{ runner.os }}-
 
       - name: 构建 APK
+        env:
+          # 容器里必然是 root；buildozer 默认会弹 y/n 交互确认，
+          # 非交互环境读到 EOF 就 EOFError 崩掉。buildozer.spec 里
+          # 已设 warn_on_root = 0，这里再加一道环境变量保险。
+          BUILDOZER_WARN_ON_ROOT: "0"
         run: |
           export GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx3g -Dorg.gradle.daemon=false"
           export ANDROID_ACCEPT_SDK_LICENSE=1

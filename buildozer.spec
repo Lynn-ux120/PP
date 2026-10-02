@@ -47,8 +47,13 @@ presplash.color = #FDF2F7
 # ---------------- 安卓参数 ----------------
 android.api = 34
 android.minapi = 24
-android.ndk = 25b
-android.archs = arm64-v8a,armeabi-v7a
+# NDK 版本故意不写死：让 buildozer 用与自身 python-for-android 匹配的默认版本。
+# 写死一个版本有可能撞上 p4a 不支持的区间，且要多下载一份 ~1GB 的 NDK。
+# android.ndk =
+# 只编 arm64 可以省掉几乎一半的编译时间（pygame / CPython 要按架构各编一遍）。
+# 2018 年之后在售的安卓手机基本都是 arm64；
+# 如果装到很老的 32 位机器上提示不兼容，把 armeabi-v7a 加回来重跑即可。
+android.archs = arm64-v8a
 android.accept_sdk_license = True
 android.allow_backup = True
 android.debug_artifact = apk
@@ -62,4 +67,7 @@ android.enable_androidx = True
 
 [buildozer]
 log_level = 2
-warn_on_root = 1
+# 容器里 buildozer 一定是 root 身份运行。若保持默认的 1，
+# 它会弹出 "Are you sure you want to continue [y/n]?" 交互确认，
+# 而 CI 是非交互环境 → 读到 EOF → EOFError 直接构建失败。
+warn_on_root = 0
