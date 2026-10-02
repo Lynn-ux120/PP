@@ -36,6 +36,12 @@ pygame-ce 从 2.5.0 起把 **meson** 设为默认构建后端（`build-backend =
 longintrepr.h**）被完全跳过。所以这里只把 `[build-system]` 换成 setuptools，
 让 p4a 那条 `pip install .` 走 `setup.py`。
 
+另外还要给 `setup.py` 补一个 sys.path 修正：pip 的构建后端是
+`python .../_in_process.py` 起的子进程，**工程根目录不在 sys.path 上**，
+而 setup.py 第 12 行就 `import buildconfig.get_version`，会直接
+`ModuleNotFoundError`（p4a 先跑的 `python setup.py build_ext` 反而没事）。
+两条都已经在本地的真实 sdist 上复现并验证过修法。
+
 ⚠️ `[project]` 表**必须原样保留，绝对不能改**（踩过两次坑）：
    - 删掉整个 `[project]` → `buildconfig/get_version.py` 取不到
      `conf["project"]["version"]` → `KeyError: 'project'`；
@@ -69,6 +75,47 @@ _SETUPTOOLS_BUILD_SYSTEM = (
 
 # 从 "[build-system]" 一直匹配到下一个行首的 "[" 之前（即整个段）。
 _BUILD_SYSTEM_RE = re.compile(r"\[build-system\][\s\S]*?(?=\n\[|\Z)")
+
+# ---- setup.py 的 sys.path 补丁 -------------------------------------------
+# pip 的 in-process hook 是 `python .../_in_process.py` 起的子进程，
+# 此时 sys.path[0] 是 pip 自己的目录，**工程根目录不在 sys.path 上**，
+# 于是 setup.py 第 12 行的 `import buildconfig.get_version` 直接
+# `ModuleNotFoundError: No module named 'buildconfig'`。
+# （p4a 先跑的 `python setup.py build_ext` 反而没问题，因为那时
+#   sys.path[0] 就是工程根目录。）
+# 这里在 import 之前把工程根目录插进 sys.path，让 setup.py 在两种调用方式下
+# 都能工作。（另一条可行路线是把后端换成 `setuptools.build_meta:__legacy__`，
+# 但那依赖一个"将来会被移除"的兼容别名，不如这条自包含。）
+_SETUP_SYS_PATH_ANCHOR = "import buildconfig.get_version as pg_ver"
+_SETUP_SYS_PATH_PATCH = (
+    "# >>> p4a-recipes/pygame-ce 补丁：pip 的构建后端不会把工程根目录放进\n"
+    "# >>> sys.path（它用 `python _in_process.py` 起子进程），下面这行\n"
+    "# >>> `import buildconfig` 会 ModuleNotFoundError。直接跑\n"
+    "# >>> `python setup.py ...` 时没这个问题。这里自行补上。\n"
+    "import os as _os, sys as _sys\n"
+    "_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
+    "# <<< 补丁结束\n"
+    + _SETUP_SYS_PATH_ANCHOR
+)
+
+
+def _patch_setup_py_sys_path(build_dir: str) -> None:
+    """给 setup.py 加上"把自己所在目录放进 sys.path"，使 pip 的构建后端
+    也能正常 import 工程内模块（详见上方注释）。"""
+    path = join(build_dir, "setup.py")
+    with open(path, encoding="utf-8") as fp:
+        text = fp.read()
+
+    if _SETUP_SYS_PATH_ANCHOR not in text:
+        raise RuntimeError(
+            "setup.py 里找不到 `%s`，sys.path 补丁失效；"
+            "上游结构可能已变化" % _SETUP_SYS_PATH_ANCHOR)
+    if "_os.path.dirname(_os.path.abspath(__file__))" in text:
+        return  # 已经打过了
+
+    text = text.replace(_SETUP_SYS_PATH_ANCHOR, _SETUP_SYS_PATH_PATCH, 1)
+    with open(path, "w", encoding="utf-8") as fp:
+        fp.write(text)
 
 
 def _force_setuptools_backend(build_dir: str) -> None:
@@ -184,6 +231,8 @@ class Pygame2Recipe(CompiledComponentsPythonRecipe):
 
             # 关掉 meson 后端，逼 pip 走 setup.py（详见文件头部说明）。
             _force_setuptools_backend(".")
+            # 让 setup.py 在 pip 的构建后端里也能 import 到工程内模块。
+            _patch_setup_py_sys_path(".")
 
     def get_recipe_env(self, arch):
         env = super().get_recipe_env(arch)
