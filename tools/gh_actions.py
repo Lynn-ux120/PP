@@ -2,9 +2,17 @@
 """查看 GitHub Actions 的运行 / 任务 / 日志（只读）。
 
 用法：
-    python tools/gh_actions.py runs                 # 最近的运行列表
-    python tools/gh_actions.py jobs <run_id>        # 某次运行的步骤明细
-    python tools/gh_actions.py logs <run_id>        # 下载失败步骤的日志
+    python tools/gh_actions.py runs                      # 最近的运行列表
+    python tools/gh_actions.py jobs <run_id>             # 某次运行的步骤明细
+    python tools/gh_actions.py logs <run_id>             # 下载失败步骤的日志（只留关键行）
+    python tools/gh_actions.py logs <run_id> --raw       # 原样打印日志（默认末 300 行）
+    python tools/gh_actions.py logs <run_id> --raw --tail 800
+    python tools/gh_actions.py logs <run_id> --grep "buildconfig" --context 8
+
+为什么要有 --raw / --grep：
+    默认的"关键词过滤"会把多行 Traceback 里不含关键词的行（`File "...", line N`、
+    `<module>` 之类）丢掉，只剩一句 `subprocess-exited-with-error`，
+    反而看不出真正的异常。要定位就需要原样输出或按模式带上下文搜。
 
 依赖 tools/push_to_github.py 里的 GitHub 客户端与 DNS 绕过（本机 hosts 屏蔽了 GitHub）。
 
@@ -25,6 +33,12 @@ sys.path.insert(0, HERE)
 import push_to_github as P  # noqa: E402
 
 OWNER, REPO = "Lynn-ux120", "PP"
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def client():
@@ -86,27 +100,63 @@ def fetch_log(gh, job_id: int, token: str | None = None) -> bytes:
 
 def cmd_logs(gh, argv):
     run_id = argv[0]
+    raw = "--raw" in argv
+    tail = 300
+    if "--tail" in argv:
+        tail = int(argv[argv.index("--tail") + 1])
+    grep = None
+    context = 6
+    if "--grep" in argv:
+        grep = argv[argv.index("--grep") + 1]
+    if "--context" in argv:
+        context = int(argv[argv.index("--context") + 1])
+
     code, res = gh.call("GET", f"/repos/{OWNER}/{REPO}/actions/runs/{run_id}/jobs")
     if code != 200:
         print("HTTP", code, res)
         return 1
     for j in res["jobs"]:
-        if j.get("conclusion") not in (None, "success"):
-            data = fetch_log(gh, j["id"])
-            print(f"=== JOB {j['id']} {j['name']}  {len(data)} bytes ===")
-            text = data.decode("utf-8", "replace")
-            # 只打印有信息量的行，避免刷屏
-            keep = []
-            for line in text.splitlines():
-                s = re.sub(r"^\S+Z\s?", "", line)
-                if re.search(r"error|Error|ERROR|Traceback|Exception|##\[error\]|"
-                             r"failed|FAILED|No such|not found|WARNING|警告|"
-                             r"buildozer|Downloading|Unpacking|Installing|"
-                             r"Command failed|STDERR", s):
-                    keep.append(s.rstrip())
-            print("\n".join(keep[-80:]) if keep else "(无明显错误行，打印末 40 行)")
-            if not keep:
-                print("\n".join(text.splitlines()[-40:]))
+        if j.get("conclusion") in (None, "success"):
+            continue
+        data = fetch_log(gh, j["id"])
+        text = strip_ansi(data.decode("utf-8", "replace"))
+        print(f"=== JOB {j['id']} {j['name']}  {len(data)} bytes ===")
+        lines = [re.sub(r"^\S+Z\s?", "", ln) for ln in text.splitlines()]
+
+        if raw:
+            print(f"--- 原样输出末 {tail} 行 ---")
+            print("\n".join(lines[-tail:]))
+            continue
+
+        if grep:
+            pat = re.compile(grep)
+            hits = [i for i, ln in enumerate(lines) if pat.search(ln)]
+            print(f"--- 匹配 {grep!r} 的行 {len(hits)} 处（±{context} 行上下文）---")
+            shown = set()
+            for i in hits:
+                lo, hi = max(0, i - context), min(len(lines), i + context + 1)
+                if shown and lo <= max(shown) + 1:
+                    lo = max(shown) + 1
+                for k in range(lo, hi):
+                    if k not in shown:
+                        print(f"{k:>6} {lines[k]}")
+                        shown.add(k)
+                print("       ---")
+            if not hits:
+                print("(无匹配)")
+            continue
+
+        # 只打印有信息量的行，避免刷屏
+        keep = []
+        for s in lines:
+            if re.search(r"error|Error|ERROR|Traceback|Exception|##\[error\]|"
+                         r"failed|FAILED|No such|not found|WARNING|警告|"
+                         r"buildozer|Downloading|Unpacking|Installing|"
+                         r"Command failed|STDERR", s):
+                keep.append(s.rstrip())
+        print("\n".join(keep[-80:]) if keep else "(无明显错误行，打印末 40 行)")
+        if not keep:
+            print("\n".join(lines[-40:]))
     return 0
 
 

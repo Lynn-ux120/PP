@@ -188,9 +188,22 @@ def is_secret(rel: str) -> bool:
     return any(h in name for h in SECRET_HINTS)
 
 
+def is_scratch(rel: str) -> bool:
+    """排障用的临时脚本，不该进公开仓库。
+
+    本工程约定：以**单个下划线**开头的文件（如 tools/_check_state.py）
+    是一次性调试脚本，用完就丢。
+    注意必须排除 ``__init__.py`` 这种双下划线文件——p4a-recipes 里的
+    配方正是 ``__init__.py``，它**必须**上传，否则云端 p4a 找不到配方。
+    """
+    name = os.path.basename(rel)
+    return name.startswith("_") and not name.startswith("__")
+
+
 def collect_files():
     picked = []
-    skipped = []
+    secrets = []
+    scratch = []
     for base, dirs, files in os.walk(ROOT):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fn in files:
@@ -199,12 +212,17 @@ def collect_files():
             full = os.path.join(base, fn)
             rel = os.path.relpath(full, ROOT).replace(os.sep, "/")
             if is_secret(rel):
-                skipped.append(rel)
+                secrets.append(rel)
+                continue
+            if is_scratch(rel):
+                scratch.append(rel)
                 continue
             picked.append((rel, full))
     picked.sort()
-    for rel in skipped:
+    for rel in secrets:
         print(f"      ! 跳过疑似凭据文件：{rel}")
+    for rel in scratch:
+        print(f"      · 跳过临时调试脚本：{rel}")
     return picked
 
 

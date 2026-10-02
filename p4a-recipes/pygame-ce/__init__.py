@@ -42,6 +42,9 @@ longintrepr.h**）被完全跳过。所以这里只把 `[build-system]` 换成 s
 `ModuleNotFoundError`（p4a 先跑的 `python setup.py build_ext` 反而没事）。
 两条都已经在本地的真实 sdist 上复现并验证过修法。
 
+`[build-system].requires` 里必须带 **cython**：pip 的构建隔离环境里只有
+requires 列出的包，而 setup.py 缺 Cython 时会直接退出，等不到 pip 去装依赖。
+
 ⚠️ `[project]` 表**必须原样保留，绝对不能改**（踩过两次坑）：
    - 删掉整个 `[project]` → `buildconfig/get_version.py` 取不到
      `conf["project"]["version"]` → `KeyError: 'project'`；
@@ -67,9 +70,16 @@ from pythonforandroid.recipe import CompiledComponentsPythonRecipe
 from pythonforandroid.toolchain import current_directory
 
 # 用来顶掉 meson 后端。只替换 [build-system] 段，[project] 保持上游原样。
+#
+# 为什么 requires 里必须有 cython：
+#   p4a 那条 `pip install .` 是**带构建隔离**跑的（日志里能看到
+#   "Installing build dependencies ... done"），隔离环境里只有 requires
+#   列出的包。而 pygame-ce 的 setup.py 在没有 Cython 时会直接打印
+#   "You need cython." 然后 exit(1) —— 在它有机会声明构建依赖之前就退出了，
+#   所以 pip 侧永远拿不到这个依赖（鸡生蛋）。必须在这里显式写上。
 _SETUPTOOLS_BUILD_SYSTEM = (
     "[build-system]\n"
-    'requires = ["setuptools>=61.0", "wheel"]\n'
+    'requires = ["setuptools>=61.0", "wheel", "cython<=3.2.9"]\n'
     'build-backend = "setuptools.build_meta"\n'
 )
 
