@@ -1,0 +1,56 @@
+name: Build Android APK
+
+# 推送到 main / master，或在 Actions 页面手动点「Run workflow」即可出包
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: 构建 debug APK
+    runs-on: ubuntu-latest
+    # 官方镜像里已经装好 buildozer / Android SDK / NDK / JDK，省去半小时的环境搭建
+    container:
+      image: kivy/buildozer:latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # 首次构建要下载 Android SDK/NDK 并编译 pygame，约 30~50 分钟；
+      # 命中缓存后一般 10 分钟内完成。改 buildozer.spec 也不会丢 SDK 缓存。
+      - name: 缓存 buildozer 运行时与 SDK/NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            /root/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-v1-${{ github.run_id }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-v1-
+            buildozer-${{ runner.os }}-
+
+      - name: 构建 APK
+        run: |
+          export GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx3g -Dorg.gradle.daemon=false"
+          export ANDROID_ACCEPT_SDK_LICENSE=1
+          buildozer -v android debug
+
+      - name: 整理产物
+        run: |
+          mkdir -p out
+          cp bin/*.apk out/
+          ls -lh out/
+
+      - name: 上传 APK（构建完成后在本次运行页面底部下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: pp-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,37 @@
+name: Build Android APK (备用方案)
+
+# 只在 Actions 页面手动触发。
+# 如果 build-apk.yml（容器方案）在你的环境里报错，用这个：
+# 它走 Kivy 官方推荐的第三方 Action（自带 buildozer / SDK / NDK 环境）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: 构建 debug APK（buildozer-action）
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: buildozer android debug
+        id: buildozer
+        uses: ArtemSBulgakov/buildozer-action@v1
+        with:
+          command: buildozer android debug
+          buildozer_version: stable
+          workdir: .
+          spec_file: buildozer.spec
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pp-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 90

@@ -1,0 +1,31 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------- Android / buildozer 构建产物 ----------
+.buildozer/
+bin/
+out/
+*.apk
+*.aab
+
+# ---------- 开发辅助产物 ----------
+pet_game/preview/
+debug.log
+
+# ---------- 工作区内部数据 ----------
+.workbuddy/
+
+# ---------- 本地凭据 / 产物（绝对不要提交）----------
+.gh_token
+token.txt
+dist/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
