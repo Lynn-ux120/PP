@@ -42,8 +42,72 @@ CHAR_SUPERSAMPLE = 3           # 角色超采样倍率（越大越平滑，3 已
 # ---------------------------------------------------------
 # None = 自动：安卓全屏铺满，桌面保持 640x800 窗口（方便调试）
 FULLSCREEN_MODE   = None
-# 手机缩放时是否用平滑插值。True 更细腻；低端机掉帧可改 False（略快）
-MOBILE_SMOOTH_SCALE = True
+
+# 手机缩放时的插值方式 ★ 性能开关 ★
+#   True  = 平滑插值（smoothscale）。画面细腻，但 640x800 → 1080x1350
+#           这种放大在手机 CPU 上要 20~40 ms/帧，是掉帧的头号元凶。
+#   False = 最近邻（scale）。实测快 3~6 倍；640x800 放到 1080p 上，
+#           粉彩画的锯齿几乎看不出来（文字边缘会稍硬一点）。
+# 默认 False；如果你的机器很新、想要最细腻的画面，可以改回 True。
+MOBILE_SMOOTH_SCALE = False
+
+# 手机上的目标帧率。手机屏幕刷新率五花八门，
+# 与其追求 60 帧而不断掉帧，不如稳在 50（掉帧感更小）。
+# 想更省电可以调到 40 或 30。
+MOBILE_FPS = 50
+
+# ★ 最重要的性能开关 ★
+# 手机显示走 GPU 缩放（pygame.SCALED）：逻辑画布交给 SDL 的渲染器放大到整屏，
+# CPU 完全不参与缩放 —— 比软件缩放省下每帧 20~40 ms，是"手机上能不能跑顺"
+# 的关键。逻辑画布会和屏幕做成同比例，游戏画面居中，上下多出来的部分用
+# 天空色 / 草地色填平（看上去就是一整屏）。
+#
+# 万一某些机型的渲染器建不出来，platform_util 会自动检测并退回软件缩放，
+# 不会黑屏、不会崩。若真的遇到画面异常，把这里改成 False 再重新打包即可。
+MOBILE_USE_SCALED = True
+
+# =========================================================
+#  音效 ★ 想加/换音效就改这里 ★
+# ---------------------------------------------------------
+# 音频文件由 tools/make_sfx.py 用纯 Python 合成到 pet_game/sfx/*.wav
+# （不需要 numpy，也不依赖任何外部素材）。
+#
+# 【换一个互动音】把 INTERACTIONS / COMPANION_ACTIONS 那一行的
+#   sfx="..." 改成 tools/make_sfx.py 里 SOUNDS 的键名即可。
+# 【加一个全新音效】在 make_sfx.py 里写个 build_xxx()，
+#   加进 SOUNDS 表，跑一次脚本，再来这里引用。
+# =========================================================
+SFX_ENABLED       = True       # 总开关（关掉 = 完全不初始化音频设备）
+SFX_VOLUME        = 0.75       # 主音量基准（每个音效还会再乘自己的系数）
+SFX_RATE          = 22050      # 采样率，必须和 make_sfx.py 的 SR 一致
+SFX_CHANNELS      = 1          # 单声道（音效不需要立体声，省一半内存）
+# 音频缓冲。太小会爆音、太大会有延迟。手机上 1024 帧 ≈ 46 ms，是稳妥值。
+SFX_BUFFER        = 1024
+SFX_MAX_CHANNELS  = 16         # 同时最多混几个音
+SFX_MIN_GAP       = 0.045      # 同名音效的最小重播间隔，防止连点叠成噪音
+SFX_DUCK_CHANCE   = 0.0        # 预留：将来做背景音乐闪避用
+
+# 状态不佳时的软哼唧（键名对应 Pet._mood_key()）
+MOOD_SFX = {
+    "hungry":   "whimper",
+    "unhappy":  "whimper",
+    "sleepy":   "yawn",
+    "critical": "whimper",
+}
+# 播放这些心情音的最小间隔（秒）—— 哼唧太频繁会烦人
+MOOD_SFX_GAP = 14.0
+
+# 非互动类音效（界面反馈 / 解锁 / 摸小宠物）
+UI_CLICK_SFX    = "click"        # 普通按钮
+UI_DENY_SFX     = "deny"         # 按钮不可用、衣服/宠物没解锁
+PANEL_OPEN_SFX  = "panel_open"   # 打开衣橱 / 宠物面板
+PANEL_CLOSE_SFX = "panel_close"  # 关闭面板 / 安卓返回键收起面板
+WEAR_SFX        = "wear"         # 换装成功
+UNLOCK_SFX      = "unlock"       # 解锁新衣装 / 新宠物
+COMP_TOUCH_SFX  = "pet_hug"      # 直接摸草地上的小宠物
+
+# 左上角"音效开关"小按钮（标题左边那块空白）
+SFX_BTN_RECT = (14, 14, 44, 38)
 
 # =========================================================
 #  宠物
@@ -137,7 +201,7 @@ PET_MOOD_ANTICS = {
 INTERACTIONS = [
     dict(id="feed", label="喂食", hotkey="F", icon="bowl",
          gain={"hunger": 26.0}, cooldown=0.45, require={},
-         effect="food", speech="feed", react_time=1.5,
+         effect="food", speech="feed", react_time=1.5, sfx="feed",
          motion=("nod", 1.0),
          btn=((255, 214, 158), (255, 229, 186), (233, 176, 112),
               (126, 92, 58), (238, 176, 104))),
@@ -166,7 +230,7 @@ INTERACTIONS = [
     dict(id="play", label="玩耍", hotkey="Y", icon="ball",
          gain={"happiness": 30.0, "energy": -17.0}, cooldown=1.00,
          require={"energy": 16.0},
-         effect="play", speech="play", react_time=2.0,
+         effect="play", speech="play", react_time=2.0, sfx="play",
          motion=("hop", 1.3),
          btn=((176, 226, 208), (206, 240, 226), (134, 198, 176),
               (52, 110, 92), (110, 198, 172))),
@@ -174,7 +238,7 @@ INTERACTIONS = [
     dict(id="sing", label="唱歌", hotkey="G", icon="note",
          gain={"happiness": 22.0, "energy": -9.0}, cooldown=0.80,
          require={"energy": 8.0},
-         effect="music", speech="sing", react_time=1.9,
+         effect="music", speech="sing", react_time=1.9, sfx="sing",
          motion=("sway", 1.9),
          btn=((214, 196, 240), (232, 220, 250), (180, 156, 216),
               (98, 74, 140), (168, 140, 214))),
@@ -411,14 +475,14 @@ COMPANION_ACTIONS = [
     dict(id="ctoy", label="逗它", hotkey="2", icon="yarn",
          gain={"mood": 27.0, "bond": 10.0, "belly": -4.0}, cooldown=0.9,
          host_gain={"happiness": 5.0},
-         effect="ctoy", speech="ctoy", motion=("spin", 1.2),
+         effect="ctoy", speech="ctoy", motion=("spin", 1.2), sfx="pet_play",
          btn=((186, 220, 246), (212, 236, 250), (140, 190, 224),
               (62, 104, 134), (120, 178, 228))),
 
     dict(id="chug", label="抱抱", hotkey="3", icon="paw",
          gain={"bond": 15.0, "mood": 12.0}, cooldown=0.6,
          host_gain={"happiness": 6.0},
-         effect="chug", speech="chug", motion=("squeeze", 1.3),
+         effect="chug", speech="chug", motion=("squeeze", 1.3), sfx="pet_hug",
          btn=((255, 186, 208), (255, 210, 226), (234, 146, 178),
               (128, 74, 100), (240, 138, 172))),
 ]

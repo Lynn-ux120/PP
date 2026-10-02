@@ -179,6 +179,11 @@ SKIP_EXT = {".pyc", ".pyo", ".apk", ".aab"}
 # 传上去只会在公开仓库里留垃圾；而真正的仓库配置就那么几个，白名单即可。
 KEEP_DOTFILES = {".gitattributes", ".gitignore", ".gitmodules", ".editorconfig"}
 
+# 同理，隐藏**目录**默认整个跳过，只放行真正要进仓库的那一个。
+# 漏掉这条会造成实打实的泄漏：.preview_new/ 这种排障目录虽然名字以 "." 开头，
+# 但 SKIP_DIRS 是精确名匹配，os.walk 会照走不误，里面的 PNG 就被推上公开仓库了。
+KEEP_DOTDIRS = {".github"}
+
 # 凭据类文件：名字里出现这些关键词就一律不上传。
 # 曾经因为只用 .gitignore 排除、脚本又绕过了 git，差点把 .gh_token 明文推到公开仓库。
 SECRET_HINTS = ("token", "secret", "credential", ".gh_token", ".env",
@@ -211,8 +216,20 @@ def collect_files():
     picked = []
     secrets = []
     scratch = []
+    skipped_dirs = []
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        kept = []
+        for d in dirs:
+            if d in SKIP_DIRS:
+                continue
+            # 隐藏目录（.preview_new/、.bench_cache/…）整棵剪掉，只放行白名单
+            if d.startswith(".") and d not in KEEP_DOTDIRS:
+                skipped_dirs.append(
+                    os.path.relpath(os.path.join(base, d), ROOT)
+                    .replace(os.sep, "/") + "/")
+                continue
+            kept.append(d)
+        dirs[:] = kept
         for fn in files:
             if fn in SKIP_FILES or os.path.splitext(fn)[1] in SKIP_EXT:
                 continue
@@ -229,6 +246,8 @@ def collect_files():
                 continue
             picked.append((rel, full))
     picked.sort()
+    for rel in skipped_dirs:
+        print(f"      · 跳过隐藏目录：{rel}")
     for rel in secrets:
         print(f"      ! 跳过疑似凭据文件：{rel}")
     for rel in scratch:

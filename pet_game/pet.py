@@ -500,8 +500,10 @@ class Pet:
         blink = self._blink_on if blink is None else blink
 
         eat_frame = int(self._chew * 5) % 2 if self._chew > 0 else -1
-        drip_frame = int(self._tear_drip() * 8) if emo == self.SAD else -1
-        key = (oid, emo, blink, eat_frame, drip_frame)
+        # ⚠️ 角上的泪珠**不进缓存键**（它每帧都在往下滴，进键就等于每秒
+        # 重画 8 次角色；一次重画在手机上是几百毫秒 → 直接卡住）。
+        # 泪珠改成 draw() 里单独叠一层小图，见 _draw_tear_overlay()。
+        key = (oid, emo, blink, eat_frame)
         if key in self._sprite_cache:
             return self._sprite_cache[key]
 
@@ -899,16 +901,29 @@ class Pet:
         else:                                                      # 微笑
             p.arc(C_MOUTH, (130, MOUTH_Y + 2), 12, 9, 22, 158, 4)
 
-        # ---- 眼角泪珠 ----
-        if emo == self.SAD:
-            drip = self._tear_drip()
-            ty = 152 + drip * 26
-            fade = int(215 * (1 - drip))
-            if fade > 8:
-                p.soft((C_TEAR[0], C_TEAR[1], C_TEAR[2], fade),
-                       "ellipse", rect=(150, ty, 11, 15))
-                p.soft((255, 255, 255, fade // 2),
-                       "ellipse", rect=(152.5, ty + 3.5, 3.6, 5))
+    def _draw_tear_overlay(self, surface, cx, sx, scale, stable_top):
+        """
+        眼角往下滴的泪珠 —— 单独叠一层，**不进角色贴图缓存**。
+
+        (cx, sx, scale, stable_top) 是 draw() 里算出来的同一套映射参数，
+        所以泪珠会跟着角色的缩放/位移走（难过时角色不旋转，忽略旋转没问题）。
+        """
+        drip = self._tear_drip()
+        fade = int(215 * (1 - drip))
+        if fade <= 8:
+            return
+        lx = cx + (150 - PET_BOX_W / 2) * sx
+        ly = stable_top + (152 + drip * 26 + SPRITE_PAD) * scale
+        w = max(2, int(11 * sx))
+        h = max(2, int(15 * scale))
+        layer = pygame.Surface((w + 4, h + 4), pygame.SRCALPHA)
+        pygame.draw.ellipse(layer, (*C_TEAR, fade), pygame.Rect(2, 2, w, h))
+        pygame.draw.ellipse(layer, (255, 255, 255, fade // 2),
+                            pygame.Rect(2 + max(1, int(w * 0.25)),
+                                        2 + max(1, int(h * 0.25)),
+                                        max(1, int(w * 0.33)),
+                                        max(1, int(h * 0.23))))
+        surface.blit(layer, (int(lx), int(ly)))
 
     # -----------------------------------------------------
     #  对外绘制入口
@@ -954,12 +969,18 @@ class Pet:
         # 用"缩放后、旋转前"的盒子换算 —— 转圈时不至于把气泡甩出去。
         scale = pre_h / full_h
         stable_top = foot_y - pre_h
+        sx = rect.width / float(PET_BOX_W + SPRITE_PAD * 2)
 
         def sy(local_y):
             return stable_top + (local_y + SPRITE_PAD) * scale
 
         self.head_pos = (int(self.x + pose.dx), sy(26))
         self.mouth_pos = (int(self.x + pose.dx), sy(MOUTH_Y))
+
+        # 难过时眼角滴的泪 —— 单独叠加，不参与贴图缓存
+        if emo == self.SAD:
+            self._draw_tear_overlay(surface, self.x + pose.dx, sx, scale,
+                                    stable_top)
 
         if self._say_timer > 0 and self.say_text:
             self._draw_bubble(surface, self.say_text, rect)

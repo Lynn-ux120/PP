@@ -23,7 +23,8 @@ package.domain = org.fenghuayuan
 source.dir = pet_game
 
 # 打进 APK 的文件类型
-source.include_exts = py,png,jpg,jpeg,ttf,otf,ttc,json,txt
+# wav 是游戏音效（由 tools/make_sfx.py 用纯 Python 合成，见 pet_game/sfx/）
+source.include_exts = py,png,jpg,jpeg,ttf,otf,ttc,json,txt,wav
 
 # 开发辅助目录不进 APK（体积和启动速度都受益）
 source.exclude_dirs = tools,preview,__pycache__,.git,.pytest_cache

@@ -148,19 +148,33 @@ class Pen:
         char = pygame.transform.smoothscale(surf, (W, H))   # 缩回 1x → 平滑
 
     所有 width 参数也是逻辑值。
+
+    offset
+        画笔的"图层原点"（**表面像素**）。soft() 会在一个只够装下图形的小
+        图层上作画，然后整体贴回主画布 —— 这时就靠 offset 把逻辑坐标
+        换算到那个小图层的局部坐标里。
     """
 
-    __slots__ = ("surf", "k")
+    __slots__ = ("surf", "k", "ox", "oy")
 
-    def __init__(self, surface: pygame.Surface, k: int = 1):
+    def __init__(self, surface: pygame.Surface, k: int = 1, offset=(0, 0)):
         self.surf = surface
         self.k = k
+        self.ox, self.oy = offset
+
+    # ---------- 坐标换算 ----------
+    def _pt(self, x, y):
+        k = self.k
+        return int(x * k - self.ox), int(y * k - self.oy)
 
     # ---------- 基础图元 ----------
     def _rect(self, rect):
         x, y, w, h = rect
         k = self.k
-        return pygame.Rect(int(x * k), int(y * k), max(1, int(w * k)), max(1, int(h * k)))
+        return pygame.Rect(
+            *self._pt(x, y),
+            max(1, int(w * k)), max(1, int(h * k)),
+        )
 
     def _w(self, width: float) -> int:
         return max(1, int(width * self.k)) if width else 0
@@ -175,7 +189,8 @@ class Pen:
             t = i / steps
             x = (p0[0] + (p1[0] - p0[0]) * t) * k
             y = (p0[1] + (p1[1] - p0[1]) * t) * k
-            pygame.draw.circle(self.surf, color, (int(x), int(y)), brush)
+            pygame.draw.circle(self.surf, color,
+                               (int(x - self.ox), int(y - self.oy)), brush)
 
     def arc(self, color, center, rx, ry, a0, a1, width=3, steps=None):
         """
@@ -191,13 +206,14 @@ class Pen:
             a = math.radians(a0 + (a1 - a0) * i / steps)
             x = (center[0] + rx * math.cos(a)) * k
             y = (center[1] + ry * math.sin(a)) * k
-            pygame.draw.circle(self.surf, color, (int(x), int(y)), brush)
+            pygame.draw.circle(self.surf, color,
+                               (int(x - self.ox), int(y - self.oy)), brush)
 
     def circle(self, color, center, r, width=0):
         k = self.k
         pygame.draw.circle(
             self.surf, color,
-            (int(center[0] * k), int(center[1] * k)),
+            self._pt(center[0], center[1]),
             max(1, int(r * k)), self._w(width),
         )
 
@@ -211,8 +227,7 @@ class Pen:
         )
 
     def polygon(self, color, points, width=0):
-        k = self.k
-        pts = [(p[0] * k, p[1] * k) for p in points]
+        pts = [self._pt(p[0], p[1]) for p in points]
         pygame.draw.polygon(self.surf, color, pts, self._w(width))
 
     def rounded_polygon(self, color, points, radius):
@@ -226,39 +241,92 @@ class Pen:
         """
         绘制半透明图元。原理：先在独立透明图层上作画，再整体 blit 叠加，
         这样不会破坏底图已有像素的 alpha 通道。
+
+        ⚠️ 性能：这里**只分配刚好裹住图形的小图层**。
+        早期版本每次都分配一整张画布（780x900），角色一次重绘要调 16 次
+        soft()，光分配+叠加就要 24 ms（桌面），手机上直接卡到动不了 ——
+        换成包围盒之后同样一次重绘降到 3 ms 出头。
         """
-        layer = pygame.Surface(self.surf.get_size(), pygame.SRCALPHA)
-        lp = Pen(layer, self.k)
-        if shape == "ellipse":
-            lp.ellipse(rgba, kw["rect"])
+        box = self._shape_box(shape, kw)
+        if box is None:
+            return
+        bx, by, bw, bh = box
+
+        # 裁到画布范围内（超出部分 pygame 本来也会裁掉，这里只是别白分配）
+        sw, sh = self.surf.get_size()
+        x0 = max(0, bx)
+        y0 = max(0, by)
+        w = min(bw - (x0 - bx), sw - x0)
+        h = min(bh - (y0 - by), sh - y0)
+        if w <= 0 or h <= 0:
+            return
+
+        layer = pygame.Surface((w, h), pygame.SRCALPHA)
+        Pen(layer, self.k, offset=(x0, y0))._shape(rgba, shape, kw)
+        self.surf.blit(layer, (x0, y0))
+
+    def _shape_box(self, shape: str, kw):
+        """图形的包围盒（表面像素）：(x, y, w, h)。"""
+        k = self.k
+        m = 3                                    # 抗锯齿余量
+        if shape == "ellipse" or shape == "rect":
+            x, y, w, h = kw["rect"]
         elif shape == "circle":
-            lp.circle(rgba, kw["center"], kw["r"])
+            cx, cy = kw["center"]
+            r = max(0.5, float(kw["r"]))
+            x, y, w, h = cx - r, cy - r, r * 2, r * 2
         elif shape == "polygon":
-            lp.polygon(rgba, kw["points"])
+            pts = kw["points"]
+            if not pts:
+                return None
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x, y = min(xs), min(ys)
+            w, h = max(xs) - x, max(ys) - y
+        else:
+            return None
+        return (int(x * k) - m, int(y * k) - m,
+                int(w * k) + m * 2 + 2, int(h * k) + m * 2 + 2)
+
+    def _shape(self, rgba, shape: str, kw):
+        if shape == "ellipse":
+            self.ellipse(rgba, kw["rect"])
+        elif shape == "circle":
+            self.circle(rgba, kw["center"], kw["r"])
+        elif shape == "polygon":
+            self.polygon(rgba, kw["points"])
         elif shape == "rect":
-            lp.rect(rgba, kw["rect"], radius=kw.get("radius", 0))
-        self.surf.blit(layer, (0, 0))
+            self.rect(rgba, kw["rect"], radius=kw.get("radius", 0))
 
 
 # ---------------------------------------------------------
 #  贴纸描边
 # ---------------------------------------------------------
+_OUTLINE_SPOKES = 12          # 描边的"辐条"数量（越多越圆，也越慢）
+
+
 def sticker_outline(canvas: pygame.Surface, width=3,
                     color=(255, 253, 255, 255)) -> pygame.Surface:
     """
     给任意带 alpha 的贴图加一圈柔和描边（贴纸效果），
     让主体从粉彩背景里"跳"出来。
 
-    做法：提取 alpha 蒙版 → 向四周平移叠加成粗轮廓 → 把原图盖回去。
+    做法：提取 alpha 蒙版 → 沿一圈辐条平移叠加成粗轮廓 → 把原图盖回去。
     角色和角色养的小宠物共用这一个函数。
+
+    ⚠️ 性能：平移次数 = 辐条数。早期版本遍历了整个 (2w+1)² 方形区域
+    （width=3 时是 29 次全图 alpha 叠加），改成 12 根辐条后同样的观感、
+    但快了 2.4 倍。贴图只在缓存未命中时才重画，所以这已经够用了。
     """
     mask = pygame.mask.from_surface(canvas, 120)
     silhouette = mask.to_surface(setcolor=color, unsetcolor=(0, 0, 0, 0))
     out = pygame.Surface(canvas.get_size(), pygame.SRCALPHA)
-    for dx in range(-width, width + 1):
-        for dy in range(-width, width + 1):
-            if dx * dx + dy * dy <= width * width:
-                out.blit(silhouette, (dx, dy), special_flags=pygame.BLEND_RGBA_MAX)
+    for i in range(_OUTLINE_SPOKES):
+        a = math.tau * i / _OUTLINE_SPOKES
+        dx = int(round(math.cos(a) * width))
+        dy = int(round(math.sin(a) * width))
+        if dx or dy:
+            out.blit(silhouette, (dx, dy), special_flags=pygame.BLEND_RGBA_MAX)
     out.blit(canvas, (0, 0))
     return out
 
@@ -314,18 +382,52 @@ def posed_blit(surface, sprite, foot_x: float, foot_y: float, pose):
     return rect, pre_h
 
 
+# ---------------------------------------------------------
+#  文字渲染缓存
+# ---------------------------------------------------------
+# 界面上的文字绝大多数是**每帧都一样**的（按钮名、数值条标签、提示语…），
+# 一帧要渲染三十多次。缓存下来之后这些渲染基本就免费了。
+# 键里带 text，所以会变的数值（0~100）最多撑到上限然后整体清空，不会失控。
+_TEXT_CACHE: dict = {}
+_TEXT_CACHE_MAX = 512
+_TEXT_SIZE_CACHE: dict = {}
+
+
+def render_text(text: str, size: int, bold: bool, color) -> pygame.Surface:
+    """渲染一行文字（带缓存）。返回的 Surface 不要就地修改。"""
+    key = (text, size, bold, color)
+    img = _TEXT_CACHE.get(key)
+    if img is None:
+        if len(_TEXT_CACHE) >= _TEXT_CACHE_MAX:
+            _TEXT_CACHE.clear()
+        img = get_font(size, bold).render(text, True, color)
+        _TEXT_CACHE[key] = img
+    return img
+
+
+def text_size(text: str, size: int, bold: bool = False):
+    """量一行文字的宽高（带缓存 —— 按钮每帧都要量）。"""
+    key = (text, size, bold)
+    r = _TEXT_SIZE_CACHE.get(key)
+    if r is None:
+        if len(_TEXT_SIZE_CACHE) >= _TEXT_CACHE_MAX:
+            _TEXT_SIZE_CACHE.clear()
+        r = get_font(size, bold).size(text)
+        _TEXT_SIZE_CACHE[key] = r
+    return r
+
+
 def text_at(surface, text, pos, size=18, color=(120, 102, 118),
             bold=False, center=False, shadow=None):
     """绘制一行文字，返回它的 rect。"""
-    font = get_font(size, bold)
-    img = font.render(text, True, color)
+    img = render_text(text, size, bold, color)
     rect = img.get_rect()
     if center:
         rect.center = pos
     else:
         rect.topleft = pos
     if shadow:
-        sh = font.render(text, True, shadow)
+        sh = render_text(text, size, bold, shadow)
         surface.blit(sh, (rect.x + 1, rect.y + 2))
     surface.blit(img, rect)
     return rect

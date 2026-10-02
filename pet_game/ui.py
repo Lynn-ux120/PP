@@ -13,7 +13,29 @@ import math
 import pygame
 
 from config import *
-from utils import Pen, get_font, text_at, clamp, approach, mix
+from utils import (Pen, get_font, text_at, render_text, text_size,
+                   clamp, approach, mix)
+
+# ---------------------------------------------------------
+#  按钮投影缓存
+# ---------------------------------------------------------
+# 投影是一张「按钮大小的小图层」，但它只跟尺寸有关。
+# 早期版本每帧每个按钮都新建两张图层（投影 + 顶部高光），
+# 8 个互动按钮一帧就是 16 次分配 + 16 次 alpha 叠加 —— 在手机上很贵。
+_SHADOW_CACHE: dict = {}
+
+
+def _shadow_surface(w: int, h: int, off: int, radius: int) -> pygame.Surface:
+    key = (w, h, off, radius)
+    s = _SHADOW_CACHE.get(key)
+    if s is None:
+        if len(_SHADOW_CACHE) >= 64:
+            _SHADOW_CACHE.clear()
+        s = pygame.Surface((w + 4, h + off + 4), pygame.SRCALPHA)
+        pygame.draw.rect(s, (206, 184, 198, 80), pygame.Rect(0, 0, w, h),
+                         border_radius=radius)
+        _SHADOW_CACHE[key] = s
+    return s
 
 # ---------------------------------------------------------
 #  图标工厂
@@ -42,6 +64,7 @@ def make_icon(kind: str, size: int = 30, color=(120, 102, 118), accent=None) -> 
       bubble(泡泡) moon(月亮·睡觉) sun(太阳·叫醒)
       hanger(衣架·衣橱) lock(小锁·未解锁)
       paw(爪印·宠物) cookie(小饼干) yarn(毛线球)
+      sound_on / sound_off(喇叭·音效开关)
     """
     key = (kind, size, color, accent)
     if key in _icon_cache:
@@ -196,6 +219,30 @@ def make_icon(kind: str, size: int = 30, color=(120, 102, 118), accent=None) -> 
         p.line(color, (c[0] + S * 0.30, c[1] + S * 0.26),
                (c[0] + S * 0.44, c[1] + S * 0.42), S * 0.05)
 
+    # ---------- 音效开关 ----------
+    elif kind in ("sound_on", "sound_off"):
+        # 喇叭本体
+        p.polygon(color, [
+            (c[0] - S * 0.36, c[1] - S * 0.13),
+            (c[0] - S * 0.16, c[1] - S * 0.13),
+            (c[0] + S * 0.04, c[1] - S * 0.33),
+            (c[0] + S * 0.04, c[1] + S * 0.33),
+            (c[0] - S * 0.16, c[1] + S * 0.13),
+            (c[0] - S * 0.36, c[1] + S * 0.13),
+        ])
+        if kind == "sound_on":
+            # 两圈声波
+            p.arc(color, (c[0] + S * 0.06, c[1]),
+                  S * 0.19, S * 0.23, -56, 56, S * 0.072)
+            p.arc(color, (c[0] + S * 0.06, c[1]),
+                  S * 0.31, S * 0.37, -52, 52, S * 0.066)
+        else:
+            # 一个叉 → 表示静音
+            p.line(color, (c[0] + S * 0.20, c[1] - S * 0.19),
+                   (c[0] + S * 0.42, c[1] + S * 0.19), S * 0.076)
+            p.line(color, (c[0] + S * 0.42, c[1] - S * 0.19),
+                   (c[0] + S * 0.20, c[1] + S * 0.19), S * 0.076)
+
     icon = pygame.transform.smoothscale(surf, (S, S))
     _icon_cache[key] = icon
     return icon
@@ -274,11 +321,9 @@ class Button:
         if not self.enabled:
             body = mix(body, (240, 234, 240), 0.55)
 
-        # 投影：只在按钮大小的小图层上作画（避免每帧分配整屏 surface）
-        sh = pygame.Surface((r.w + 4, r.h + off + 4), pygame.SRCALPHA)
-        pygame.draw.rect(sh, (206, 184, 198, 80), pygame.Rect(0, 0, r.w, r.h),
-                         border_radius=radius)
-        surface.blit(sh, (r.x - 2, r.y + off - 2))
+        # 投影：用缓存的图层（只跟尺寸有关，不每帧新建）
+        surface.blit(_shadow_surface(r.w, r.h, off, radius),
+                     (r.x - 2, r.y + off - 2))
 
         # 按下时向下压
         r.y += int(self.anim * off)
@@ -286,12 +331,11 @@ class Button:
         # 主体
         pygame.draw.rect(surface, body, r, border_radius=radius)
 
-        # 顶部高光
-        hl = pygame.Rect(r.x + 5, r.y + 4, r.w - 10, int(r.h * 0.36))
-        hi = pygame.Surface(hl.size, pygame.SRCALPHA)
-        pygame.draw.rect(hi, (255, 255, 255, 92), pygame.Rect(0, 0, hl.w, hl.h),
+        # 顶部高光：直接混出实色画（原来是新建图层叠 92/255 的白，
+        # 落在不透明的 body 上结果完全一样，但省掉一次分配 + 叠加）
+        hl = pygame.Rect(r.x + 5, r.y + 4, r.w - 10, max(1, int(r.h * 0.36)))
+        pygame.draw.rect(surface, mix(body, (255, 255, 255), 0.36), hl,
                          border_radius=radius // 2)
-        surface.blit(hi, hl.topleft)
 
         # 描边
         pygame.draw.rect(surface, self.edge, r, 2 if compact else 3, border_radius=radius)
@@ -301,8 +345,7 @@ class Button:
         font_size = 17 if compact else 28
         gap = 7 if compact else 12
 
-        font = get_font(font_size, True)
-        label_w = font.size(self.label)[0]
+        label_w = text_size(self.label, font_size, True)[0]
         total_w = label_w + (icon_size + gap if self.icon_kind else 0)
         cx = r.centerx - total_w // 2
         cy = r.centery
@@ -319,12 +362,12 @@ class Button:
         if self.hotkey:
             bw, bh = (18, 16) if compact else (20, 18)
             inset = 6 if compact else 10
-            badge_font = get_font(11 if compact else 13, True)
             bx = r.right - bw - inset
             by = r.top + inset
             pygame.draw.rect(surface, self.edge, pygame.Rect(bx, by, bw, bh),
                              border_radius=5)
-            img = badge_font.render(self.hotkey, True, (255, 255, 255))
+            img = render_text(self.hotkey, 11 if compact else 13, True,
+                              (255, 255, 255))
             surface.blit(img, img.get_rect(center=(bx + bw // 2, by + bh // 2)))
 
         # 点击闪光
@@ -386,12 +429,11 @@ class StatBar:
                 fg = mix(self.fg, BAR_LOW_FG, 0.45 + 0.45 * k)
             fr = pygame.Rect(bar.x + 3, bar.y + 3, fill_w, bar.h - 6)
             pygame.draw.rect(surface, fg, fr, border_radius=(bar.h - 6) // 2)
-            # 顶部高光条（小图层，避免整屏分配）
+            # 顶部高光条：混成实色直接画（省掉每帧一张小图层）
             hw, hh = max(1, fr.w - 10), max(1, (bar.h - 6) // 3)
-            hi = pygame.Surface((hw, hh), pygame.SRCALPHA)
-            pygame.draw.rect(hi, (255, 255, 255, 110),
-                             pygame.Rect(0, 0, hw, hh), border_radius=hh // 2)
-            surface.blit(hi, (fr.x + 4, fr.y + 2))
+            pygame.draw.rect(surface, mix(fg, (255, 255, 255), 0.43),
+                             pygame.Rect(fr.x + 4, fr.y + 2, hw, hh),
+                             border_radius=hh // 2)
 
         # 数值
         vx = bar.right + 14

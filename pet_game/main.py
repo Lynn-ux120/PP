@@ -30,6 +30,7 @@ import sys
 
 import pygame
 
+import sfx
 from config import *
 from utils import get_font, text_at, clamp, mix, draw_panel
 from effects import ParticleSystem
@@ -152,11 +153,33 @@ def build_buttons():
 #  飘云
 # =========================================================
 class Cloud:
+    """
+    飘动的云。
+
+    形状/颜色/透明度是固定的，所以贴图在 __init__ 里画一次就够了 ——
+    早期版本每帧都给每朵云新建一张 Surface 再画三次图元。
+    """
+
     def __init__(self, x, y, scale, speed, alpha):
         self.x, self.y = x, y
         self.scale = scale
         self.speed = speed
         self.alpha = alpha
+        self._surf, self._pad = self._build()
+
+    def _build(self):
+        s = self.scale
+        w, h = 130 * s, 44 * s
+        pad = int(30 * s)
+        layer = pygame.Surface((int(w + pad * 2), int(h + pad * 2)),
+                               pygame.SRCALPHA)
+        ox, oy = pad, pad
+        col = (255, 255, 255, self.alpha)
+        pygame.draw.ellipse(layer, col, pygame.Rect(ox, oy + h * 0.42, w, h * 0.72))
+        pygame.draw.circle(layer, col, (int(ox + w * 0.28), int(oy + h * 0.52)), int(h * 0.70))
+        pygame.draw.circle(layer, col, (int(ox + w * 0.55), int(oy + h * 0.34)), int(h * 0.92))
+        pygame.draw.circle(layer, col, (int(ox + w * 0.80), int(oy + h * 0.56)), int(h * 0.62))
+        return layer, pad
 
     def update(self, dt):
         self.x += self.speed * dt
@@ -164,17 +187,7 @@ class Cloud:
             self.x = -200 * self.scale
 
     def draw(self, surface):
-        s = self.scale
-        w, h = 130 * s, 44 * s
-        pad = 30 * s
-        layer = pygame.Surface((int(w + pad * 2), int(h + pad * 2)), pygame.SRCALPHA)
-        ox, oy = pad, pad
-        col = (255, 255, 255, self.alpha)
-        pygame.draw.ellipse(layer, col, pygame.Rect(ox, oy + h * 0.42, w, h * 0.72))
-        pygame.draw.circle(layer, col, (int(ox + w * 0.28), int(oy + h * 0.52)), int(h * 0.70))
-        pygame.draw.circle(layer, col, (int(ox + w * 0.55), int(oy + h * 0.34)), int(h * 0.92))
-        pygame.draw.circle(layer, col, (int(ox + w * 0.80), int(oy + h * 0.56)), int(h * 0.62))
-        surface.blit(layer, (self.x - pad, self.y - pad))
+        surface.blit(self._surf, (self.x - self._pad, self.y - self._pad))
 
 
 # =========================================================
@@ -182,19 +195,37 @@ class Cloud:
 # =========================================================
 class Game:
     def __init__(self):
+        # 音频必须在 pygame.init() **之前**定好格式（采样率/声道/缓冲），
+        # 否则 pygame 会按默认参数先把音频设备打开，中途重开会有一声爆音。
+        sfx.pre_init()
         pygame.init()
 
         # ---------- 显示：逻辑画布始终是 640x800，桌面窗口 / 手机全屏自动适配 ----------
         # 桌面窗口尺寸刚好等于逻辑尺寸时 scale==1，表现和改造前完全一致；
-        # 手机上则等比放大铺满屏幕，信箱区域用背景渐变补上。
+        # 手机上优先走 GPU 缩放（见 config.MOBILE_USE_SCALED），
+        # 画面之外的区域用天空色 / 草地色延伸出去，不会出现黑边。
         self.display = DisplayManager(
             (WIDTH, HEIGHT), TITLE,
             fullscreen=FULLSCREEN_MODE,
             smooth=MOBILE_SMOOTH_SCALE,
-            gradient=(BG_TOP, BG_BOTTOM))
+            band_colors=(BG_TOP, GROUND_DEEP),
+            use_scaled=MOBILE_USE_SCALED)
         self.window = self.display.window       # 真实窗口（手机上比逻辑画布大）
         self.screen = self.display.logical      # ← 所有绘制都画在它上面
         self.android_status = setup_android()   # 屏幕常亮 + 沉浸式（桌面返回 False）
+
+        # ---------- 音效 ----------
+        # 拿不到音频设备也不影响游戏：sfx 内部会把所有播放请求吃掉。
+        self.sfx_ok = sfx.init()
+        self.sfx_muted = sfx.is_muted()
+        self._sfx_note = ""
+        self._sfx_note_t = 0.0
+        self.sfx_btn = Button(
+            SFX_BTN_RECT, "", (255, 250, 246), (255, 254, 252),
+            (238, 224, 232), (150, 122, 138),
+            icon="sound_off" if (self.sfx_muted or not self.sfx_ok) else "sound_on",
+            icon_color=(150, 122, 138), radius=13)
+        self._mood_sfx_t = -99.0
 
         self.clock = pygame.time.Clock()
         self.running = True
@@ -307,11 +338,37 @@ class Game:
                 if key is not None:
                     self.key_map[key] = spec["id"]
 
+    # ---------------- 音效 ----------------
+    def toggle_sfx(self):
+        """左上角喇叭按钮 / 键盘 M：开合音效。"""
+        if not self.sfx_ok:
+            self._sfx_note = "没有找到可用的音频设备"
+            self._sfx_note_t = 2.4
+            sfx.play(UI_DENY_SFX)
+            return
+        muted = sfx.toggle_mute()
+        self.sfx_muted = muted
+        self.sfx_btn.icon_kind = "sound_off" if muted else "sound_on"
+        if muted:
+            sfx.play(UI_CLICK_SFX)
+        else:
+            # 解除静音时给一声反馈，让用户确信声音回来了
+            sfx.play(PANEL_OPEN_SFX)
+
+    def _sfx(self, name, volume=1.0):
+        """播一个音效（名字为空/没设备时静默跳过）。"""
+        if name:
+            sfx.play(name, volume)
+
     # ---------------- 互动 ----------------
     def do_action(self, action_id: str):
         res = self.pet.interact(action_id)
         if not res:
             return
+        if res["effect"] == "wake":          # "睡觉"按钮在她睡着时是"叫醒"
+            self._sfx("wake")
+        else:
+            self._sfx(INTERACTION_MAP.get(action_id, {}).get("sfx"))
         self._spawn_effect(res["effect"])
         self._spawn_gain_text(res["gained"])
 
@@ -382,6 +439,12 @@ class Game:
         for b, _ in self.buttons:
             b.hover = False
         self.wardrobe_btn.hover = False
+        self._sfx(PANEL_OPEN_SFX)
+
+    def _close_wardrobe(self):
+        if self.wardrobe_open:
+            self.wardrobe_open = False
+            self._sfx(PANEL_CLOSE_SFX)
 
     def try_wear(self, outfit_id: str):
         """点击卡片：能穿就换，没解锁就给出条件提示。"""
@@ -391,12 +454,14 @@ class Game:
         if not self.pet.outfit_unlocked(outfit_id):
             self.wardrobe_msg = f"这件还锁着哦 —— {unlock_text(spec['unlock'])}"
             self.wardrobe_msg_t = 2.6
+            self._sfx(UI_DENY_SFX, 0.75)
             return
         if outfit_id == self.pet.outfit_id:
             return
         self.pet.set_outfit(outfit_id, force=True)
         self._wear_flash = 1.0
         self.wardrobe_open = False
+        self._sfx(WEAR_SFX)
         hp = self.pet.head_pos
         self.particles.spawn_sparkles(hp, n=18, spread=112)
         self.particles.spawn_hearts(hp, n=5, spread=74, scale=1.15)
@@ -413,6 +478,7 @@ class Game:
             return
         self.pet.set_outfit(nxt, force=True)
         self._wear_flash = 0.75
+        self._sfx(WEAR_SFX, 0.8)
         self.particles.spawn_sparkles(self.pet.head_pos, n=10, spread=88)
         self.pet.say(f"「{OUTFIT_MAP[nxt]['name']}」", 1.7)
 
@@ -420,7 +486,7 @@ class Game:
         """衣橱打开时，事件只走这里（底层按钮一律不响应）。"""
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_ESCAPE, pygame.K_c):
-                self.wardrobe_open = False
+                self._close_wardrobe()
             elif event.key == pygame.K_LEFT:
                 self.cycle_outfit(-1)
             elif event.key == pygame.K_RIGHT:
@@ -438,7 +504,7 @@ class Game:
                     return
             # 点空白处 = 关掉
             if not pygame.Rect(WARDROBE_PANEL).collidepoint(event.pos):
-                self.wardrobe_open = False
+                self._close_wardrobe()
 
     # ---------------- 小宠物 ----------------
     def do_comp_action(self, action_id: str):
@@ -446,6 +512,7 @@ class Game:
         res = self.companion.interact(action_id)
         if not res:
             return
+        self._sfx(COMPANION_ACTION_MAP.get(action_id, {}).get("sfx"))
         self._spawn_comp_effect(res["effect"])
         self._spawn_comp_gain(res["gained"])
 
@@ -468,6 +535,7 @@ class Game:
         res = self.companion.pet()
         if not res:
             return
+        self._sfx(COMP_TOUCH_SFX, 0.8)
         self._spawn_comp_effect(res["effect"])
         self._spawn_comp_gain(res["gained"])
         self._glance_at_companion()
@@ -526,6 +594,12 @@ class Game:
             b.hover = False
         self.wardrobe_btn.hover = False
         self.comp_btn.hover = False
+        self._sfx(PANEL_OPEN_SFX)
+
+    def _close_comp_panel(self):
+        if self.comp_panel_open:
+            self.comp_panel_open = False
+            self._sfx(PANEL_CLOSE_SFX)
 
     def try_choose_species(self, sid: str):
         spec = COMPANION_MAP.get(sid)
@@ -534,12 +608,14 @@ class Game:
         if not self.companion.species_unlocked(sid):
             self.comp_msg = f"还没遇见它呢 —— {comp_unlock_text(spec['unlock'])}"
             self.comp_msg_t = 2.6
+            self._sfx(UI_DENY_SFX, 0.75)
             return
         if sid == self.companion.species_id:
             return
         self.companion.set_species(sid, force=True)
         self._comp_flash = 1.0
         self.comp_panel_open = False
+        self._sfx(UNLOCK_SFX, 0.85)
         self.companion.say(random.choice(SPEECH["cgreet"]), 2.4)
         cp = self._comp_focus()
         self.particles.spawn_sparkles(cp, n=16, spread=84)
@@ -563,7 +639,7 @@ class Game:
 
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_ESCAPE, pygame.K_t):
-                self.comp_panel_open = False
+                self._close_comp_panel()
             elif event.key == pygame.K_LEFT:
                 self.cycle_species(-1)
             elif event.key == pygame.K_RIGHT:
@@ -582,7 +658,7 @@ class Game:
                     self.try_choose_species(sid)
                     return
             if not pygame.Rect(COMPANION_PANEL).collidepoint(event.pos):
-                self.comp_panel_open = False
+                self._close_comp_panel()
 
     # ---------------- 事件 ----------------
     def handle_events(self):
@@ -599,9 +675,9 @@ class Game:
             # 安卓返回键：先收起打开的面板，再退出游戏
             if event.type == pygame.KEYDOWN and is_back_key(event.key):
                 if self.wardrobe_open:
-                    self.wardrobe_open = False
+                    self._close_wardrobe()
                 elif self.comp_panel_open:
-                    self.comp_panel_open = False
+                    self._close_comp_panel()
                 else:
                     self.running = False
                 continue
@@ -627,6 +703,8 @@ class Game:
                     self.open_wardrobe()
                 elif event.key == pygame.K_t:
                     self.open_comp_panel()
+                elif event.key == pygame.K_m:
+                    self.toggle_sfx()
                 elif event.key == pygame.K_LEFT:
                     self.cycle_outfit(-1)
                 elif event.key == pygame.K_RIGHT:
@@ -635,6 +713,10 @@ class Game:
                     self.do_comp_action(self.comp_key_map[event.key])
                 elif event.key in self.key_map:
                     self.do_action(self.key_map[event.key])
+                continue
+
+            if self.sfx_btn.handle_event(event):
+                self.toggle_sfx()
                 continue
 
             if self.wardrobe_btn.handle_event(event):
@@ -652,8 +734,16 @@ class Game:
                 continue
 
             for btn, spec in self.buttons:
-                if btn.handle_event(event):
+                if btn.enabled and btn.handle_event(event):
                     self.do_action(spec["id"])
+                    break
+            else:
+                # 点到了灰掉的按钮 → 给一声"现在还不行"，比默默没反应友好
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for btn, _ in self.buttons:
+                        if not btn.enabled and btn.rect.collidepoint(event.pos):
+                            self._sfx(UI_DENY_SFX, 0.6)
+                            break
 
     # ---------------- 更新 ----------------
     def update(self, dt):
@@ -681,6 +771,12 @@ class Game:
 
         self.particles.update(dt)
 
+        # 状态不佳时轻轻哼一声（同一句至少隔 MOOD_SFX_GAP 秒才再响）
+        mood = self.pet._mood_key()
+        if mood in MOOD_SFX and self.time - self._mood_sfx_t > MOOD_SFX_GAP:
+            self._mood_sfx_t = self.time
+            self._sfx(MOOD_SFX[mood], 0.85)
+
         for key, bar in self.bars.items():
             bar.update(dt, self.pet.get_stat(key), STAT_MAX)
 
@@ -688,11 +784,13 @@ class Game:
             b.update(dt)
         self.wardrobe_btn.update(dt)
         self.comp_btn.update(dt)
+        self.sfx_btn.update(dt)
         for b, spec in self.comp_actions:
             b.enabled = comp.can_interact(spec["id"])
             b.update(dt)
         self.wardrobe_msg_t = max(0.0, self.wardrobe_msg_t - dt)
         self.comp_msg_t = max(0.0, self.comp_msg_t - dt)
+        self._sfx_note_t = max(0.0, self._sfx_note_t - dt)
         self._wear_flash = max(0.0, self._wear_flash - dt * 1.8)
         self._comp_flash = max(0.0, self._comp_flash - dt * 1.8)
 
@@ -710,6 +808,7 @@ class Game:
         if self.pet.pending_unlocks:
             oid = self.pet.pending_unlocks.pop(0)
             name = OUTFIT_MAP[oid]["name"]
+            self._sfx(UNLOCK_SFX)
             self.pet.say(f"解锁新衣装「{name}」！按 C 看看～", 3.4)
             self.particles.spawn_sparkles(self.pet.head_pos, n=18, spread=118)
             self.particles.spawn_hearts(self.pet.head_pos, n=4, spread=64, scale=0.95)
@@ -718,6 +817,7 @@ class Game:
         if comp.pending_unlocks:
             sid = comp.pending_unlocks.pop(0)
             name = COMPANION_MAP[sid]["name"]
+            self._sfx(UNLOCK_SFX)
             self.pet.say(f"我们认识了新伙伴「{name}」！按 T 看看～", 3.4)
             cp = self._comp_focus()
             self.particles.spawn_sparkles(cp, n=18, spread=96)
@@ -778,9 +878,10 @@ class Game:
         self.companion.draw(s)
         self.particles.draw(s)
 
-        # 右上角"衣装" / "宠物"按钮
+        # 右上角"衣装" / "宠物"按钮 与 左上角音效开关
         self.wardrobe_btn.draw(s)
         self.comp_btn.draw(s)
+        self.sfx_btn.draw(s)
 
         # 按钮
         for b, _ in self.buttons:
@@ -807,11 +908,15 @@ class Game:
         # 底部提示（手机没有键盘，提示里就不写快捷键了）
         hint = ("点按钮互动　·　点「衣装」换衣服　·　点「宠物」照顾小家伙　·　点小家伙摸摸它"
                 if self.display.android else
-                "点按钮互动　·　C 衣橱　·　T 宠物　·　点小宠物摸摸它　·　R 重来")
+                "点按钮互动　·　C 衣橱　·　T 宠物　·　点小宠物摸摸它　·　M 音效")
         text_at(s, hint, (WIDTH // 2, 786), size=13, color=TEXT_SOFT, center=True)
 
+        # 音效开关的临时提示（比如"没有找到可用的音频设备"）
+        if self._sfx_note_t > 0 and self._sfx_note:
+            self._draw_toast(s, self._sfx_note, 622)
+
         if SHOW_FPS:
-            text_at(s, f"FPS {int(self.clock.get_fps())}", (10, 10), size=14,
+            text_at(s, f"FPS {int(self.clock.get_fps())}", (12, 60), size=14,
                     color=TEXT_SOFT)
 
         # 缩放到真实窗口后上屏（桌面 scale==1 时等价于原来的 pygame.display.flip()）
@@ -844,6 +949,19 @@ class Game:
                          3, border_radius=h // 2)
         layer.blit(img, (17, (h - img.get_height()) // 2))
         surface.blit(layer, (x, y))
+
+    def _draw_toast(self, surface, text, y):
+        """一条居中的小提示胶囊（只在偶发提示时用，不进每帧热路径）。"""
+        font = get_font(14, True)
+        img = font.render(text, True, (206, 120, 144))
+        w, h = img.get_width() + 30, 30
+        lay = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.rect(lay, (255, 250, 252, 238), pygame.Rect(0, 0, w, h),
+                         border_radius=h // 2)
+        pygame.draw.rect(lay, (246, 196, 214, 255), pygame.Rect(0, 0, w, h), 2,
+                         border_radius=h // 2)
+        lay.blit(img, (15, (h - img.get_height()) // 2))
+        surface.blit(lay, lay.get_rect(center=(WIDTH // 2, y)))
 
     # ---------------- 衣橱绘制 ----------------
     def _draw_wardrobe(self, surface):
@@ -1103,8 +1221,11 @@ class Game:
 
     # ---------------- 主循环 ----------------
     def run(self):
+        # 手机屏幕刷新率五花八门：与其冲 60 帧然后不停掉帧，
+        # 不如按 config.MOBILE_FPS 稳在一个够用的值上（掉帧感更小、也更省电）。
+        target = MOBILE_FPS if self.display.android else FPS
         while self.running:
-            dt = min(self.clock.tick(FPS) / 1000.0, MAX_DT)
+            dt = min(self.clock.tick(target) / 1000.0, MAX_DT)
             self.handle_events()
             self.update(dt)
             self.draw()
