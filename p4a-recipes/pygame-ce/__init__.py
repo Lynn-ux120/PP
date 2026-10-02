@@ -48,14 +48,25 @@ from pythonforandroid.recipe import CompiledComponentsPythonRecipe
 from pythonforandroid.toolchain import current_directory
 
 # 强制走 setup.py（Android 唯一可用的构建路径）。
-# setup.py 会读取构建目录下的 setup.py / Setup 文件，因此这里只保留构建后端声明。
-_SETUPTOOLS_PYPROJECT = (
-    "# 由 p4a-recipes/pygame-ce 覆盖：\n"
-    "# pygame-ce 默认的 meson 后端不支持 Android，必须退回 setuptools + setup.py。\n"
-    "[build-system]\n"
-    'requires = ["setuptools>=61.0", "wheel"]\n'
-    'build-backend = "setuptools.build_meta"\n'
-)
+#
+# 注意：[project] 段**不能删**。setup.py 第 12 行就 `import buildconfig.get_version`，
+# 而 get_version.py 在 Python>=3.11 下会 tomllib 读 pyproject.toml 的
+# `conf["project"]["version"]`。上一版把整个文件覆盖掉，直接
+# `KeyError: 'project'` 挂在 setup.py 第 12 行。
+# 这里只保留 name/version 最小集，避免 setuptools 对 readme/license 等
+# 与 setup.py 重复定义的字段抛 InvalidConfigError（已本地实测：name/version
+# 两处同时定义不会报错，[project] 的值会胜出）。
+_SETUPTOOLS_PYPROJECT = """\
+# 由 p4a-recipes/pygame-ce 覆写：pygame-ce 默认的 meson 后端不支持 Android，
+# 必须退回 setuptools + setup.py（原因见该配方文件头部）。
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygame-ce"
+version = "{version}"
+"""
 
 
 def _inc_flags(dirs) -> str:
@@ -154,7 +165,7 @@ class Pygame2Recipe(CompiledComponentsPythonRecipe):
 
             # 关掉 meson 后端（详见文件头部说明），逼 pip 走 setup.py。
             with open("pyproject.toml", "w") as fp:
-                fp.write(_SETUPTOOLS_PYPROJECT)
+                fp.write(_SETUPTOOLS_PYPROJECT.format(version=self.version))
 
     def get_recipe_env(self, arch):
         env = super().get_recipe_env(arch)
