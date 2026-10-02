@@ -8,6 +8,7 @@
     python tools/gh_actions.py logs <run_id> --raw       # 原样打印日志（默认末 300 行）
     python tools/gh_actions.py logs <run_id> --raw --tail 800
     python tools/gh_actions.py logs <run_id> --grep "buildconfig" --context 8
+    python tools/gh_actions.py logs <run_id> --all --grep "pygame"   # 成功也看
 
 为什么要有 --raw / --grep：
     默认的"关键词过滤"会把多行 Traceback 里不含关键词的行（`File "...", line N`、
@@ -101,6 +102,9 @@ def fetch_log(gh, job_id: int, token: str | None = None) -> bytes:
 def cmd_logs(gh, argv):
     run_id = argv[0]
     raw = "--raw" in argv
+    # 默认只看失败的 job。构建**成功**时想核对"某个步骤到底跑了没"
+    # （例如 pygame 是否真的装进 site-packages）就得带上 --all。
+    only_failed = "--all" not in argv
     tail = 300
     if "--tail" in argv:
         tail = int(argv[argv.index("--tail") + 1])
@@ -116,7 +120,7 @@ def cmd_logs(gh, argv):
         print("HTTP", code, res)
         return 1
     for j in res["jobs"]:
-        if j.get("conclusion") in (None, "success"):
+        if only_failed and j.get("conclusion") in (None, "success"):
             continue
         data = fetch_log(gh, j["id"])
         text = strip_ansi(data.decode("utf-8", "replace"))

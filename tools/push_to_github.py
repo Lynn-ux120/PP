@@ -30,6 +30,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socket
 import ssl
 import sys
@@ -37,6 +38,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 API = "https://api.github.com"
@@ -345,6 +347,7 @@ def wait_and_download(gh: GitHub, owner: str, repo: str, branch: str,
     seen_any = False
     idle = 0
     beat = 0
+    misses = 0
     while time.time() < deadline:
         elapsed = int((time.time() - started) / 60)
         code, res = gh.call(
@@ -360,10 +363,20 @@ def wait_and_download(gh: GitHub, owner: str, repo: str, branch: str,
         idle = 0
         runs = res.get("workflow_runs", [])
         if head_sha:
-            runs = [r for r in runs if r.get("head_sha") == head_sha]
+            # 用**前缀**匹配：正常推送路径传进来的是完整 40 位 sha，
+            # 而 `--watch --sha` 通常只给前 8 位（GitHub 页面上的短 sha）。
+            # 早先这里写的是 `== head_sha`，于是短 sha 永远匹配不到，
+            # 表现为一直刷"运行记录还没注册"直到超时。
+            runs = [r for r in runs
+                    if (r.get("head_sha") or "").startswith(head_sha)]
         if not runs:
             if not seen_any:
-                print("  · 运行记录还没注册，稍等…")
+                misses += 1
+                if misses <= 3:
+                    print("  · 运行记录还没注册，稍等…")
+                elif misses == 4:
+                    print("  · 仍未找到匹配该提交的运行 —— 若是用 --watch 查"
+                          "旧构建，请确认 --sha 写的是该次提交的 sha。")
             time.sleep(10)
             continue
         seen_any = True
@@ -389,6 +402,64 @@ def wait_and_download(gh: GitHub, owner: str, repo: str, branch: str,
     return None
 
 
+def _download_to(gh: GitHub, api_path: str, dst: str) -> bool:
+    """下载一个会 **302 到 Azure Blob** 的接口（构建产物 zip）。
+
+    GitHub 的 `.../actions/artifacts/{id}/zip` 会 302 到
+    `productionresultssa*.blob.core.windows.net` 上的**预签名**地址。
+    默认 opener 会把 `Authorization` 头一起转发过去，Azure 回：
+
+        401 InvalidAuthenticationInfo
+        The access token was missing or malformed.
+
+    —— 和当初取 Actions 日志踩的是同一个坑（见 tools/gh_actions.py 的
+    fetch_log）。所以先用 NoRedirect 拿 Location，再**不带认证头**下载。
+    """
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    url = API + api_path
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {gh.token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "PP-build"})
+    try:
+        opener = urllib.request.build_opener(NoRedirect)
+        with opener.open(req, timeout=30) as r:
+            # 没有重定向，说明直接给了内容
+            with open(dst, "wb") as f:
+                shutil.copyfileobj(r, f)
+            return True
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+        if not loc:
+            print(f"  ✗ 下载失败（HTTP {e.code}，且响应里没有 Location）")
+            return False
+    except Exception as exc:
+        print(f"  ✗ 下载失败（{type(exc).__name__}）：{exc}")
+        return False
+
+    plain = urllib.request.Request(loc, headers={"User-Agent": "PP-build"})
+    with urllib.request.urlopen(plain, timeout=300) as r:
+        with open(dst, "wb") as f:
+            shutil.copyfileobj(r, f)
+    return True
+
+
+def _extract_apks(zip_path: str, outdir: str):
+    """把产物 zip 里的 .apk 解出来（artifact 里就是一个 zip 包着 apk）。"""
+    found = []
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.filename.lower().endswith(".apk"):
+                target = os.path.join(outdir, os.path.basename(info.filename))
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                found.append(target)
+    return found
+
+
 def _download(gh: GitHub, owner: str, repo: str, run_id: int,
               outdir: str, run_url: str):
     code, res = gh.call("GET",
@@ -399,16 +470,28 @@ def _download(gh: GitHub, owner: str, repo: str, run_id: int,
         return None
     os.makedirs(outdir, exist_ok=True)
     for art in arts:
-        dst = os.path.join(outdir, art["name"] + ".zip")
-        code, blob = gh.call(
-            "GET", f"/repos/{owner}/{repo}/actions/artifacts/{art['id']}/zip",
-            raw=True)
-        if code != 200:
-            print(f"  ✗ 下载 {art['name']} 失败：{blob}")
+        zpath = os.path.join(outdir, art["name"] + ".zip")
+        if not _download_to(
+                gh, f"/repos/{owner}/{repo}/actions/artifacts/{art['id']}/zip",
+                zpath):
+            print(f"  ✗ 下载 {art['name']} 失败")
             continue
-        with open(dst, "wb") as f:
-            f.write(blob)
-        print(f"  ✓ 已下载 {dst}  ({len(blob) / 1048576:.1f} MB)")
+        print(f"  ✓ 已下载 {art['name']}.zip  "
+              f"({os.path.getsize(zpath) / 1048576:.1f} MB)")
+
+        try:
+            apks = _extract_apks(zpath, outdir)
+        except zipfile.BadZipFile as exc:
+            print(f"  ✗ {zpath} 不是合法 zip：{exc}")
+            continue
+        if not apks:
+            print(f"  ! {art['name']}.zip 里没找到 .apk（保留 zip 供检查）")
+            continue
+        for a in apks:
+            print(f"      → {a}  ({os.path.getsize(a) / 1048576:.1f} MB)")
+        # 解出来了就把 zip 清掉，dist/ 里只留 apk
+        os.remove(zpath)
+
     print(f"\n构建页面：{run_url}")
     return outdir
 
