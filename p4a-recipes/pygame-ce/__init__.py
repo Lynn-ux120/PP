@@ -36,14 +36,54 @@ pygame-ce 从 2.5.0 起把 **meson** 设为默认构建后端（`build-backend =
 longintrepr.h**）被完全跳过。所以这里只把 `[build-system]` 换成 setuptools，
 让 p4a 那条 `pip install .` 走 `setup.py`。
 
-另外还要给 `setup.py` 补一个 sys.path 修正：pip 的构建后端是
-`python .../_in_process.py` 起的子进程，**工程根目录不在 sys.path 上**，
-而 setup.py 第 12 行就 `import buildconfig.get_version`，会直接
-`ModuleNotFoundError`（p4a 先跑的 `python setup.py build_ext` 反而没事）。
-两条都已经在本地的真实 sdist 上复现并验证过修法。
+为什么还要动 setup.py？（两个坑，都是 pip 的构建后端与直接跑 setup.py 的差异）
+-----------------------------------------------------------------------------
+p4a 对一个 recipe 会跑两条路径，行为**不一样**：
+
+    (a) `python setup.py build_ext -v`     ← cwd=源码根，sys.argv[0]='setup.py'
+    (b) `pip install . --compile --target` ← pip 的 PEP517 后端，
+      它用 `python .../pyproject_hooks/_in_process/_in_process.py <hook>` 起子进程
+
+坑 1 —— 工程根不在 sys.path 上：
+    (a) 时 `sys.path[0]` 就是源码根，`import buildconfig.get_version` 正常；
+    (b) 时 `sys.path[0]` 是 pip 自己的目录，于是 setup.py 第 12 行
+    `import buildconfig.get_version` 直接
+    `ModuleNotFoundError: No module named 'buildconfig'`。
+
+坑 2 —— setup.py 里的 `os.chdir` 会跳错地方（★本轮踩得最隐蔽的一个）：
+    setup.py 第 173~175 行是
+
+        # get us to the correct directory
+        path = os.path.split(os.path.abspath(sys.argv[0]))[0]
+        os.chdir(path)
+
+    (a) 时 `sys.argv[0] == 'setup.py'` → chdir 到源码根，没问题；
+    (b) 时 **`sys.argv[0]` 是 pip 的 `_in_process.py` 的绝对路径** →
+        chdir 到 pip 的内部目录！于是后面第 329~330 行
+
+            headers = glob.glob(os.path.join('src_c', '*.h'))
+            headers.remove(os.path.join('src_c', 'scale.h'))
+
+        的 glob 在 pip 的目录里当然一个头文件都找不到，list 为空 →
+        `ValueError: list.remove(x): x not in list`。
+
+    这个坑特别难查：`src_c/scale.h` 在源码里**明明存在**，
+    build_ext 阶段也确实通过了，只有 pip 那条路径炸；
+    而且**本地复现时极容易漏掉** —— 如果直接 `python -c "import
+    setuptools.build_meta as bm; bm.get_requires_for_build_wheel({})"`，
+    `sys.argv[0]` 会是 `'-c'`，chdir 变成原地不动，于是"本地怎么试都过、
+    CI 上怎么试都挂"。要忠实复现就必须**真的用 pip 的 `BuildBackendHookCaller`
+    起子进程**（见 tools/ 里的对照实验记录）。
+
+所以补丁做三件事，插在 setup.py 顶部（锚点在第 12 行那句 import 之前，
+必须早于第 173 行的 chdir）：
+    1. 把源码根放进 `sys.path`（修坑 1）；
+    2. 把 `sys.argv[0]` 改写成本目录下的 `setup.py`（修坑 2，让那条 chdir 变成空操作）；
+    3. 顺手 `os.chdir()` 到源码根，作为双保险。
 
 `[build-system].requires` 里必须带 **cython**：pip 的构建隔离环境里只有
-requires 列出的包，而 setup.py 缺 Cython 时会直接退出，等不到 pip 去装依赖。
+requires 列出的包，而 setup.py 缺 Cython 时会直接 `sys.exit(1)`，等不到
+pip 去装依赖（鸡生蛋）。
 
 ⚠️ `[project]` 表**必须原样保留，绝对不能改**（踩过两次坑）：
    - 删掉整个 `[project]` → `buildconfig/get_version.py` 取不到
@@ -86,44 +126,50 @@ _SETUPTOOLS_BUILD_SYSTEM = (
 # 从 "[build-system]" 一直匹配到下一个行首的 "[" 之前（即整个段）。
 _BUILD_SYSTEM_RE = re.compile(r"\[build-system\][\s\S]*?(?=\n\[|\Z)")
 
-# ---- setup.py 的 sys.path 补丁 -------------------------------------------
-# pip 的 in-process hook 是 `python .../_in_process.py` 起的子进程，
-# 此时 sys.path[0] 是 pip 自己的目录，**工程根目录不在 sys.path 上**，
-# 于是 setup.py 第 12 行的 `import buildconfig.get_version` 直接
-# `ModuleNotFoundError: No module named 'buildconfig'`。
-# （p4a 先跑的 `python setup.py build_ext` 反而没问题，因为那时
-#   sys.path[0] 就是工程根目录。）
-# 这里在 import 之前把工程根目录插进 sys.path，让 setup.py 在两种调用方式下
-# 都能工作。（另一条可行路线是把后端换成 `setuptools.build_meta:__legacy__`，
-# 但那依赖一个"将来会被移除"的兼容别名，不如这条自包含。）
-_SETUP_SYS_PATH_ANCHOR = "import buildconfig.get_version as pg_ver"
-_SETUP_SYS_PATH_PATCH = (
-    "# >>> p4a-recipes/pygame-ce 补丁：pip 的构建后端不会把工程根目录放进\n"
-    "# >>> sys.path（它用 `python _in_process.py` 起子进程），下面这行\n"
-    "# >>> `import buildconfig` 会 ModuleNotFoundError。直接跑\n"
-    "# >>> `python setup.py ...` 时没这个问题。这里自行补上。\n"
-    "import os as _os, sys as _sys\n"
-    "_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))\n"
-    "# <<< 补丁结束\n"
-    + _SETUP_SYS_PATH_ANCHOR
+# ---- setup.py 顶部的兼容补丁 ---------------------------------------------
+# 锚点：setup.py 第 12 行的 `import buildconfig.get_version as pg_ver`。
+# 必须选在它前面，因为第 173 行的 os.chdir 也要靠这里的修正来纠正
+# （见文件头部"坑 2"）。插在最顶部也最安全：pip 后端和直接跑 setup.py
+# 两种情况下 `__file__` 都能拿到本文件路径。
+_SETUP_ANCHOR = "import buildconfig.get_version as pg_ver"
+
+_SETUP_PATCH = (
+    "# >>> p4a-recipes/pygame-ce 补丁（开始）\n"
+    "# pip 的 PEP517 后端用 `python .../_in_process.py <hook>` 起子进程，\n"
+    "# 此时 sys.path[0] 和 sys.argv[0] 都指向 pip 自己，而不是本工程根目录：\n"
+    "#   1) `import buildconfig...` 会 ModuleNotFoundError；\n"
+    "#   2) 下面第 173 行的 `os.chdir(dirname(abspath(sys.argv[0])))`\n"
+    "#      会跳到 pip 的目录，导致 `glob('src_c/*.h')` 为空，\n"
+    "#      进而 `headers.remove('src_c/scale.h')` 抛 ValueError。\n"
+    "# 直接跑 `python setup.py ...` 时这两条都不成立，所以只在 pip 路径下会炸。\n"
+    "import os as _pg_os, sys as _pg_sys\n"
+    '_pg_here = _pg_os.path.dirname(_pg_os.path.abspath(\n'
+    '    globals().get("__file__") or "setup.py"))\n'
+    "_pg_os.chdir(_pg_here)\n"
+    "_pg_sys.path.insert(0, _pg_here)\n"
+    '_pg_sys.argv[0] = _pg_os.path.join(_pg_here, "setup.py")\n'
+    "# <<< p4a-recipes/pygame-ce 补丁（结束）\n"
+    + _SETUP_ANCHOR
 )
 
 
-def _patch_setup_py_sys_path(build_dir: str) -> None:
-    """给 setup.py 加上"把自己所在目录放进 sys.path"，使 pip 的构建后端
-    也能正常 import 工程内模块（详见上方注释）。"""
+def _patch_setup_py(build_dir: str) -> None:
+    """修正 setup.py 在 pip 构建后端下的 sys.path / sys.argv[0] / cwd。
+
+    三件事都只在 pip 的 PEP517 后端里才出问题（详见文件头部说明）。
+    """
     path = join(build_dir, "setup.py")
     with open(path, encoding="utf-8") as fp:
         text = fp.read()
 
-    if _SETUP_SYS_PATH_ANCHOR not in text:
+    if _SETUP_ANCHOR not in text:
         raise RuntimeError(
-            "setup.py 里找不到 `%s`，sys.path 补丁失效；"
-            "上游结构可能已变化" % _SETUP_SYS_PATH_ANCHOR)
-    if "_os.path.dirname(_os.path.abspath(__file__))" in text:
+            "setup.py 里找不到 `%s`，补丁锚点失效；"
+            "上游结构可能已变化" % _SETUP_ANCHOR)
+    if "_pg_sys.argv[0]" in text:
         return  # 已经打过了
 
-    text = text.replace(_SETUP_SYS_PATH_ANCHOR, _SETUP_SYS_PATH_PATCH, 1)
+    text = text.replace(_SETUP_ANCHOR, _SETUP_PATCH, 1)
     with open(path, "w", encoding="utf-8") as fp:
         fp.write(text)
 
@@ -241,8 +287,8 @@ class Pygame2Recipe(CompiledComponentsPythonRecipe):
 
             # 关掉 meson 后端，逼 pip 走 setup.py（详见文件头部说明）。
             _force_setuptools_backend(".")
-            # 让 setup.py 在 pip 的构建后端里也能 import 到工程内模块。
-            _patch_setup_py_sys_path(".")
+            # 修正 pip 构建后端下的 sys.path / sys.argv[0] / cwd。
+            _patch_setup_py(".")
 
     def get_recipe_env(self, arch):
         env = super().get_recipe_env(arch)

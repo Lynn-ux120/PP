@@ -172,6 +172,11 @@ SKIP_DIRS = {".git", ".workbuddy", "__pycache__", "preview", ".buildozer",
 SKIP_FILES = {"debug.log", ".DS_Store", "Thumbs.db", ".build_log.txt"}
 SKIP_EXT = {".pyc", ".pyo", ".apk", ".aab"}
 
+# 仓库根要保留的隐藏文件（其余以 "." 开头的一律不上传）。
+# 理由是这类文件几乎都是本机排障产物（.build_log.txt、.probe.txt…），
+# 传上去只会在公开仓库里留垃圾；而真正的仓库配置就那么几个，白名单即可。
+KEEP_DOTFILES = {".gitattributes", ".gitignore", ".gitmodules", ".editorconfig"}
+
 # 凭据类文件：名字里出现这些关键词就一律不上传。
 # 曾经因为只用 .gitignore 排除、脚本又绕过了 git，差点把 .gh_token 明文推到公开仓库。
 SECRET_HINTS = ("token", "secret", "credential", ".gh_token", ".env",
@@ -215,6 +220,9 @@ def collect_files():
                 secrets.append(rel)
                 continue
             if is_scratch(rel):
+                scratch.append(rel)
+                continue
+            if fn.startswith(".") and fn not in KEEP_DOTFILES:
                 scratch.append(rel)
                 continue
             picked.append((rel, full))
