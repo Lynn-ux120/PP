@@ -109,7 +109,15 @@ class GitHub:
                 "应当传 load_token(args) 的返回值。")
         self.ctx = ssl.create_default_context()
 
-    def call(self, method: str, path: str, payload=None, raw=False):
+    def call(self, method: str, path: str, payload=None, raw=False,
+             tries: int = 4, pause: float = 5.0):
+        """发一个 API 请求。
+
+        网络层失败会自动重试（`tries` 次）——长轮询里一次读超时
+        不该让整个"等待构建"流程崩掉（踩过：等了 10 分钟被
+        `TimeoutError: The read operation timed out` 打断）。
+        注意 HTTPError 是正常业务响应（401/404/409…），不重试。
+        """
         url = path if path.startswith("http") else API + path
         body = None
         headers = {
@@ -129,21 +137,30 @@ class GitHub:
             print(f"  [debug] token 长度={len(self.token)} sha256={fp}")
 
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(req, timeout=60, context=self.ctx) as r:
-                data = r.read()
-                if os.environ.get("PP_DEBUG"):
-                    print(f"  [debug] <- HTTP {r.status}")
-                return r.status, (data if raw else json.loads(data or b"{}"))
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", "replace")
-            if os.environ.get("PP_DEBUG"):
-                print(f"  [debug] <- HTTP {e.code} {detail[:200]}")
+        for attempt in range(tries):
             try:
-                detail = json.loads(detail).get("message", detail)
-            except Exception:
-                pass
-            return e.code, detail
+                with urllib.request.urlopen(req, timeout=60, context=self.ctx) as r:
+                    data = r.read()
+                    if os.environ.get("PP_DEBUG"):
+                        print(f"  [debug] <- HTTP {r.status}")
+                    return r.status, (data if raw else json.loads(data or b"{}"))
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", "replace")
+                if os.environ.get("PP_DEBUG"):
+                    print(f"  [debug] <- HTTP {e.code} {detail[:200]}")
+                try:
+                    detail = json.loads(detail).get("message", detail)
+                except Exception:
+                    pass
+                return e.code, detail
+            except Exception as exc:  # 网络层：超时 / DNS / TLS / 连接重置
+                if attempt < tries - 1:
+                    print(f"  · 网络抖动（{type(exc).__name__}），"
+                          f"{pause:.0f}s 后重试 {attempt + 2}/{tries}")
+                    time.sleep(pause)
+                    continue
+                print(f"  ✗ 请求失败（{type(exc).__name__}）：{exc}")
+                return 0, str(exc)
 
 
 # =========================================================
@@ -282,32 +299,65 @@ def push(gh: GitHub, repo: str, branch: str, message: str):
         return None
 
     print(f"  ✓ 已推送到 {branch}")
-    return owner
+    return owner, commit_sha
 
 
 def wait_and_download(gh: GitHub, owner: str, repo: str, branch: str,
-                      outdir: str, timeout_min: int = 90):
+                      outdir: str, head_sha: str = "", timeout_min: int = 90):
+    """等本次推送触发的那次运行。
+
+    必须按 head_sha 过滤：新推送的 run 记录有几秒的注册延迟，
+    如果直接取列表第一条，会抓到**上一次**的陈旧运行，
+    于是"刚推完就报构建失败"。这个竞态踩过一次。
+    """
     print("\n=== 等待云端构建 ===")
+    if head_sha:
+        print(f"  · 目标提交 {head_sha[:8]}")
     deadline = time.time() + timeout_min * 60
+    started = time.time()
     run = None
+    seen_any = False
+    idle = 0
+    beat = 0
     while time.time() < deadline:
+        elapsed = int((time.time() - started) / 60)
         code, res = gh.call(
             "GET", f"/repos/{owner}/{repo}/actions/runs"
-                   f"?branch={branch}&per_page=5")
-        if code == 200 and res.get("workflow_runs"):
-            r = res["workflow_runs"][0]
-            tag = f'{r["id"]} {r["status"]}/{r.get("conclusion")}'
-            if run != tag:
-                run = tag
-                print(f"  · 运行 {r['id']}：{r['status']} "
-                      f"{r.get('conclusion') or ''}".rstrip())
-            if r["status"] == "completed":
-                if r.get("conclusion") != "success":
-                    print(f"  ✗ 构建未成功：{r.get('conclusion')}"
-                          f"\n    日志：{r['html_url']}")
-                    return None
-                return _download(gh, owner, repo, r["id"], outdir,
-                                 r["html_url"])
+                   f"?branch={branch}&per_page=20")
+        if code != 200:
+            idle += 1
+            if idle % 5 == 0:
+                print(f"  · 连续 {idle} 次没拿到运行列表（已等 {elapsed} 分钟），继续…")
+            time.sleep(30)
+            continue
+
+        idle = 0
+        runs = res.get("workflow_runs", [])
+        if head_sha:
+            runs = [r for r in runs if r.get("head_sha") == head_sha]
+        if not runs:
+            if not seen_any:
+                print("  · 运行记录还没注册，稍等…")
+            time.sleep(10)
+            continue
+        seen_any = True
+        r = runs[0]
+        tag = f'{r["id"]} {r["status"]}/{r.get("conclusion")}'
+        if run != tag:
+            run = tag
+            beat = elapsed
+            print(f"  · [{elapsed} 分钟] 运行 {r['id']}：{r['status']} "
+                  f"{r.get('conclusion') or ''}".rstrip())
+        elif elapsed >= beat + 5:
+            beat = elapsed
+            print(f"  · [{elapsed} 分钟] 仍在构建中（fetch/编译阶段较慢是正常的）")
+        if r["status"] == "completed":
+            if r.get("conclusion") != "success":
+                print(f"  ✗ 构建未成功：{r.get('conclusion')}"
+                      f"\n    日志：{r['html_url']}")
+                return None
+            return _download(gh, owner, repo, r["id"], outdir,
+                             r["html_url"])
         time.sleep(30)
     print("  ✗ 等待超时，请自行到 Actions 页面查看")
     return None
@@ -401,6 +451,9 @@ def main():
     ap.add_argument("--message", default="游戏本体 + 安卓打包配置 + 云端构建流水线")
     ap.add_argument("--wait", action="store_true", help="推完后等构建结果")
     ap.add_argument("--download", action="store_true", help="构建成功后下载 APK")
+    ap.add_argument("--watch", action="store_true",
+                    help="不推送，只盯已经触发的那次构建（配合 --download）")
+    ap.add_argument("--sha", default="", help="配合 --watch：只盯这个提交")
     ap.add_argument("--outdir", default=os.path.join(ROOT, "dist"))
     args = ap.parse_args()
 
@@ -421,16 +474,31 @@ def main():
     print(f"  · api.github.com → {ip or '解析失败'}")
 
     gh = GitHub(token)
+
+    if args.watch:
+        # 已经推过了，只想盯构建结果，就别再推一次（否则会多触发一次构建）
+        code, user = gh.call("GET", "/user")
+        if code != 200:
+            print(f"  ✗ 令牌无效（HTTP {code}）：{user}")
+            return 1
+        owner = user["login"]
+        print(f"  ✓ 账号：{owner}（跳过推送，只盯构建）")
+        wait_and_download(gh, owner, args.repo, args.branch, args.outdir,
+                          head_sha=args.sha)
+        return 0
+
     print("\n=== 推送 ===")
-    owner = push(gh, args.repo, args.branch, args.message)
-    if not owner:
+    pushed = push(gh, args.repo, args.branch, args.message)
+    if not pushed:
         return 1
+    owner, commit_sha = pushed
 
     print(f"\n仓库地址：https://github.com/{owner}/{args.repo}")
     print(f"构建页面：https://github.com/{owner}/{args.repo}/actions")
 
     if args.wait or args.download:
-        wait_and_download(gh, owner, args.repo, args.branch, args.outdir)
+        wait_and_download(gh, owner, args.repo, args.branch, args.outdir,
+                          head_sha=commit_sha)
     return 0
 
 

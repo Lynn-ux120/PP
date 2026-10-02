@@ -22,17 +22,21 @@ jobs:
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      # 首次构建要下载 Android SDK/NDK 并编译 pygame，约 30~50 分钟；
-      # 命中缓存后一般 10 分钟内完成。改 buildozer.spec 也不会丢 SDK 缓存。
+      # 首次构建要下载 Android SDK/NDK 并编译 CPython + pygame-ce，约 30~50 分钟；
+      # 命中缓存后一般 10 分钟内完成。改 buildozer.spec 也不会丢 SDK/NDK 缓存。
+      #
+      # ⚠️ 路径是 /github/home 而不是 /root：
+      #    container 模式下 HOME=/github/home，SDK/NDK 都落在那里。
+      #    之前写成 /root/.buildozer，等于每次都在缓存空气，白等 10 分钟重下。
       - name: 缓存 buildozer 运行时与 SDK/NDK
         uses: actions/cache@v4
         with:
           path: |
-            /root/.buildozer
+            /github/home/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-v2-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-v3-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-v2-
+            buildozer-${{ runner.os }}-v3-
             buildozer-${{ runner.os }}-
 
       - name: 构建 APK
@@ -45,6 +49,18 @@ jobs:
           export GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx3g -Dorg.gradle.daemon=false"
           export ANDROID_ACCEPT_SDK_LICENSE=1
           buildozer -v android debug
+
+      # 构建失败时也把 SDK/NDK 缓存存下来，否则每次排查都要重下几个 GB。
+      # actions/cache 的自动保存只在成功路径上生效，这里显式兜底。
+      - name: 失败时也保存缓存
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /github/home/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-v3-${{ hashFiles('buildozer.spec') }}
 
       - name: 整理产物
         run: |

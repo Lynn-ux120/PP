@@ -31,9 +31,21 @@ source.exclude_patterns = *.pyc,*.pyo,*.md,debug.log
 
 version = 1.0.0
 
-# pygame 由 python-for-android 的 pygame 配方编译（对应 SDL2）
-# pyjnius 用于屏幕常亮 / 沉浸式全屏（platform_util.py 里有 try/except 兜底）
-requirements = python3,pygame,pyjnius
+# pygame 由 python-for-android 的 pygame-ce 配方编译（对应 SDL2）。
+#
+# ⚠️ 这里**必须**写 pygame-ce，不能写 pygame：
+#    p4a 内置的 pygame 配方写死 pygame 2.1.0（2021 年），它的 C 源码里
+#    `#include "longintrepr.h"` 自 Python 3.11 起就找不到该头文件了，
+#    在新版 p4a（Python 3.14）上必然报
+#        src_c/_sdl2/sdl2.c: fatal error: 'longintrepr.h' file not found
+#    pygame-ce 是社区续作，提供**同名 pygame 模块**，支持到 Python 3.15，
+#    游戏代码里 `import pygame` 一行都不用改。
+#    pygame-ce 不在 p4a 内置配方里，所以要用下面 p4a.local_recipes 自带一份。
+# pyjnius 用于屏幕常亮 / 沉浸式全屏（platform_util.py 里有 try/except 兜底）。
+requirements = python3,pygame-ce,pyjnius
+
+# 自带配方的目录（相对执行 buildozer 的工作目录，也就是仓库根）
+p4a.local_recipes = ./p4a-recipes
 
 # 竖屏（游戏逻辑分辨率 640x800 就是竖屏比例）
 orientation = portrait
